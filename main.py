@@ -276,3 +276,26 @@ def locate_text(req: LocateRequest):
     doc.close()
     confidence = 'HIGH' if len(matches) == 1 else ('MEDIUM' if len(matches) <= 3 else 'LOW')
     return LocateResponse(query=req.search_text, matches=matches, confidence=confidence)
+
+
+# ── Diagnostico: texto crudo de una pagina (para depurar layouts nuevos) ──
+
+class PageTextRequest(BaseModel):
+    pdf_base64: str
+    page: int  # 1-indexed
+
+
+@app.post("/page_text")
+def page_text(req: PageTextRequest):
+    try:
+        pdf_bytes = base64.b64decode(req.pdf_base64)
+    except Exception:
+        raise HTTPException(400, "pdf_base64 invalido")
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    if req.page < 1 or req.page > len(doc):
+        doc.close()
+        raise HTTPException(400, f"Pagina {req.page} fuera de rango (PDF tiene {len(doc)} paginas)")
+    page = doc[req.page - 1]
+    text = page.get_text("text")
+    doc.close()
+    return {"page": req.page, "text": text}
