@@ -37,6 +37,10 @@ class SubLocation(BaseModel):
     # aparece impreso justo antes del valor. Necesario cuando el mismo valor se repite dentro de
     # la MISMA cuenta en varios campos distintos (caso real: Saldo, Credito alto y Vencido pueden
     # ser identicos). Cuando se da, solo se aceptan valores en la MISMA linea que esa etiqueta.
+    highlight_full_row: bool = False  # cuando el argumento no depende de aislar el valor de UN
+    # buro especifico (ej. "esta cuenta aparece bajo mas de un nombre"), resalta toda la fila de
+    # valores en vez de intentar desambiguar por columna de buro. Requiere field_label_text.
+    # Mas simple y seguro quen que forzar una desambiguacion incierta entre varias coincidencias.
 
 
 class EvidenceItem(BaseModel):
@@ -93,7 +97,13 @@ def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hi
     cuenta comparten el mismo valor (caso real confirmado: Saldo, Credito alto y Vencido pueden
     ser identicos dentro de una sola cuenta).
     """
-    anchor_text = account_number if account_number else account_name
+    # NOTA: account_number NO se usa como ancla principal por defecto -- en el caso real que
+    # motivo agregarlo (BCN/NCB) el numero de cuenta es COMPARTIDO entre las dos entradas
+    # (justamente porque se investiga si son la misma deuda), asi que usarlo como ancla las
+    # confunde entre si. El nombre de cuenta SI las distingue bien y ya funciona (confirmado
+    # con JPMCB/SANTANDER). account_number queda disponible para casos futuros donde sea
+    # genuinamente mas especifico que el nombre, pero no reemplaza el nombre por defecto.
+    anchor_text = account_name
     candidates = []
     for page_num in range(len(doc)):
         page = doc[page_num]
@@ -162,6 +172,87 @@ def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hi
     return best_page, best_name_rect, best_value_rect, confidence, reason, (best_source == 'same_page')
 
 
+def find_full_row_evidence(doc, account_name: str, field_label_text: str):
+    """
+    Modo mas simple y robusto para casos donde no hace falta aislar el valor de UN buro
+    especifico (ej. discrepancias sobre identidad de la cuenta, no sobre un dato puntual).
+    Busca account_name (misma pagina o pagina anterior, igual que el ancla normal), luego
+    field_label_text en la pagina resultante, cercano al nombre. Devuelve la fila COMPLETA
+    (todos los valores en esa linea) para resaltarla entera, sin desambiguar por columna.
+
+    Igual que find_account_value_pair: revisa TODAS las paginas antes de decidir (no se
+    detiene en la primera coincidencia) y solo confirma con HIGH si exactamente una pagina
+    califica -- si mas de una pagina tiene una coincidencia valida, es ambiguo y se reporta
+    como tal en vez de adivinar cual es la correcta.
+    """
+    page_candidates = []  # una entrada por pagina que tenga al menos un candidato valido
+
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        label_matches = page.search_for(field_label_text)
+        if not label_matches:
+            continue
+
+        name_matches_same_page = page.search_for(account_name)
+        name_matches_prev_page = doc[page_num - 1].search_for(account_name) if page_num > 0 else []
+
+        candidates = []
+        for label_rect in label_matches:
+            for name_rect in name_matches_same_page:
+                vdist = label_rect.y0 - name_rect.y0
+                if -20 <= vdist <= 500:
+                    candidates.append((label_rect, vdist, 'same_page'))
+            if name_matches_prev_page:
+                candidates.append((label_rect, 99999, 'prev_page'))
+
+        if not candidates:
+            continue
+
+        candidates.sort(key=lambda c: (0 if c[2] == 'same_page' else 1, c[1]))
+        best_label_rect, _, source = candidates[0]
+        page_candidates.append((page_num, best_label_rect, source))
+
+    if not page_candidates:
+        return None, None, None, None, 'No se encontro el nombre de cuenta y la etiqueta de campo juntos en ninguna pagina'
+
+    if len(page_candidates) > 1:
+        pages_found = [p[0] + 1 for p in page_candidates]
+        return None, None, None, None, f'La combinacion de nombre de cuenta + etiqueta aparece en mas de una pagina ({pages_found}) -- no se puede confirmar cual es la correcta sin ambiguedad'
+
+    page_num, best_label_rect, source = page_candidates[0]
+    page = doc[page_num]
+
+    # Ancho real de la fila: el borde derecho del ultimo texto que comparte la misma linea
+    # (mismo y0, tolerancia de 3pt), no el ancho completo de la pagina -- evita que el
+    # recorte/highlight se corte visualmente en el borde de la pagina.
+    words = page.get_text("words")
+    row_right_edge = best_label_rect.x1
+    for w in words:
+        wx0, wy0, wx1, wy1 = w[0], w[1], w[2], w[3]
+        if abs(wy0 - best_label_rect.y0) <= 3:
+            row_right_edge = max(row_right_edge, wx1)
+    row_right_edge = min(page.rect.width - 10, row_right_edge + 10)
+
+    row_rect = fitz.Rect(best_label_rect.x0, best_label_rect.y0, row_right_edge, best_label_rect.y1)
+    return page_num, best_label_rect, row_rect, (source == 'same_page'), None
+
+
+def crop_full_row(doc, page_num, label_rect, row_rect, dpi=200):
+    page = doc[page_num]
+    highlight = page.add_highlight_annot(row_rect)
+    highlight.set_colors(stroke=(1, 0.85, 0))
+    highlight.update()
+
+    clip = fitz.Rect(
+        max(0, label_rect.x0 - 15),
+        max(0, label_rect.y0 - 8),
+        min(page.rect.width - 5, row_rect.x1 + 15),
+        min(page.rect.height, label_rect.y1 + 20),
+    )
+    pix = page.get_pixmap(clip=clip, dpi=dpi)
+    return pix
+
+
 def crop_evidence_region(doc, page_num, name_rect, value_rect, same_page=True, dpi=200):
     page = doc[page_num]
     highlight = page.add_highlight_annot(value_rect)
@@ -222,6 +313,29 @@ def build_evidence_package(req: BuildPackageRequest):
         crops = []
 
         for sub in item.sub_locations:
+            if sub.highlight_full_row:
+                if not sub.field_label_text:
+                    sub_results.append(LocatedSubResult(
+                        label=sub.label, located=False, confidence='NONE',
+                        reason='highlight_full_row requiere field_label_text'
+                    ))
+                    continue
+                page_num, label_rect, row_rect, same_page, fail_reason = find_full_row_evidence(
+                    source_doc, sub.account_name, sub.field_label_text
+                )
+                if page_num is not None:
+                    pix = crop_full_row(source_doc, page_num, label_rect, row_rect)
+                    crops.append((pix, sub, page_num + 1))
+                    sub_results.append(LocatedSubResult(
+                        label=sub.label, located=True, page=page_num + 1, confidence='HIGH'
+                    ))
+                else:
+                    sub_results.append(LocatedSubResult(
+                        label=sub.label, located=False, confidence='NONE',
+                        reason=fail_reason
+                    ))
+                continue
+
             page_num, name_rect, value_rect, confidence, reason, same_page = find_account_value_pair(
                 source_doc, sub.account_name, sub.target_value, sub.bureau_hint, sub.account_number, sub.field_label_text
             )
@@ -260,7 +374,15 @@ def build_evidence_package(req: BuildPackageRequest):
             for pix, sub, source_page in crops:
                 evidence_page.insert_text((50, y_cursor), f"Source: Original Credit Report - Page {source_page} ({sub.label})", fontsize=8, fontname="helv")
                 y_cursor += 12
-                img_rect = fitz.Rect(50, y_cursor, 50 + pix.width * 0.5, y_cursor + pix.height * 0.5)
+                # Conversion correcta de pixeles a puntos: los recortes se capturan a 200 DPI
+                # (ver dpi=200 en crop_evidence_region/crop_full_row), y 1 punto = 200/72 pixeles
+                # a esa resolucion. Un factor fijo de 0.5 (usado antes) es incorrecto y sobre-
+                # dimensiona la imagen ~40%, arriesgando que se salga de la pagina en recortes
+                # anchos como el modo de fila completa.
+                px_to_pt = 72.0 / 200.0
+                img_w = pix.width * px_to_pt
+                img_h = pix.height * px_to_pt
+                img_rect = fitz.Rect(50, y_cursor, 50 + img_w, y_cursor + img_h)
                 evidence_page.insert_image(img_rect, pixmap=pix)
                 y_cursor = img_rect.y1 + 20
 
