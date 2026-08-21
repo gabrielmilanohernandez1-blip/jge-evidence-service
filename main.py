@@ -30,6 +30,13 @@ class SubLocation(BaseModel):
     target_value: str
     bureau_hint: Optional[str] = None  # ej. "TransUnion" -- desambigua cuando el mismo valor
     # aparece en varias columnas de buro (caso comun: mismo balance en 2-3 columnas)
+    account_number: Optional[str] = None  # ej. "101099****" -- cuando se da, se usa como ancla
+    # PRINCIPAL en vez de account_name. Mas confiable que el nombre cuando el nombre es corto
+    # (ej. "BCN", "NCB") y aparece muchas veces en tablas de historial de pago de la misma pagina.
+    field_label_text: Optional[str] = None  # ej. "Saldo:" -- texto EXACTO de la etiqueta tal como
+    # aparece impreso justo antes del valor. Necesario cuando el mismo valor se repite dentro de
+    # la MISMA cuenta en varios campos distintos (caso real: Saldo, Credito alto y Vencido pueden
+    # ser identicos). Cuando se da, solo se aceptan valores en la MISMA linea que esa etiqueta.
 
 
 class EvidenceItem(BaseModel):
@@ -72,13 +79,21 @@ class BuildPackageResponse(BaseModel):
 
 # ── Localizacion determinística ─────────────────────────────────────────
 
-def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hint: Optional[str] = None):
+def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hint: Optional[str] = None, account_number: Optional[str] = None, field_label_text: Optional[str] = None):
     """
-    Busca target_value en cada pagina, y busca account_name en esa MISMA pagina o en la
-    pagina ANTERIOR (las cuentas frecuentemente empiezan con su nombre/numero en una pagina
-    y su tabla de detalle (con las fechas) continua en la pagina siguiente, sin repetir el
-    nombre ahi -- caso real confirmado en produccion).
+    Busca target_value en cada pagina, y busca el ancla en esa MISMA pagina o en la pagina
+    ANTERIOR (las cuentas frecuentemente empiezan con su nombre/numero en una pagina y su tabla
+    de detalle continua en la siguiente, sin repetir el nombre ahi -- caso real confirmado en
+    produccion). El ancla es account_number cuando se proporciona (mas especifico y confiable
+    que un nombre corto como "BCN"/"NCB" que puede repetirse muchas veces en una pagina con
+    tablas de historial de pago), o account_name en su defecto.
+
+    Si field_label_text se proporciona (ej. "Saldo:"), se descartan los value_matches que no
+    esten en la MISMA linea que esa etiqueta -- necesario cuando varios campos de la MISMA
+    cuenta comparten el mismo valor (caso real confirmado: Saldo, Credito alto y Vencido pueden
+    ser identicos dentro de una sola cuenta).
     """
+    anchor_text = account_number if account_number else account_name
     candidates = []
     for page_num in range(len(doc)):
         page = doc[page_num]
@@ -86,8 +101,18 @@ def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hi
         if not value_matches:
             continue
 
-        name_matches_same_page = page.search_for(account_name)
-        name_matches_prev_page = doc[page_num - 1].search_for(account_name) if page_num > 0 else []
+        if field_label_text:
+            label_matches = page.search_for(field_label_text)
+            if label_matches:
+                value_matches = [
+                    v for v in value_matches
+                    if any(abs(v.y0 - lm.y0) <= 4 for lm in label_matches)
+                ]
+            if not value_matches:
+                continue
+
+        name_matches_same_page = page.search_for(anchor_text)
+        name_matches_prev_page = doc[page_num - 1].search_for(anchor_text) if page_num > 0 else []
 
         bureau_x_range = None
         if bureau_hint:
@@ -95,6 +120,7 @@ def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hi
             if len(bureau_matches) == 1:
                 bx = bureau_matches[0]
                 bureau_x_range = (bx.x0 - 10, bx.x0 + 140)
+
 
         for value_rect in value_matches:
             in_bureau_column = (
@@ -197,7 +223,7 @@ def build_evidence_package(req: BuildPackageRequest):
 
         for sub in item.sub_locations:
             page_num, name_rect, value_rect, confidence, reason, same_page = find_account_value_pair(
-                source_doc, sub.account_name, sub.target_value, sub.bureau_hint
+                source_doc, sub.account_name, sub.target_value, sub.bureau_hint, sub.account_number, sub.field_label_text
             )
             if page_num is not None and confidence == 'HIGH':
                 pix = crop_evidence_region(source_doc, page_num, name_rect, value_rect, same_page=same_page)
