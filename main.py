@@ -73,44 +73,56 @@ class BuildPackageResponse(BaseModel):
 # ── Localizacion determinística ─────────────────────────────────────────
 
 def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hint: Optional[str] = None):
+    """
+    Busca target_value en cada pagina, y busca account_name en esa MISMA pagina o en la
+    pagina ANTERIOR (las cuentas frecuentemente empiezan con su nombre/numero en una pagina
+    y su tabla de detalle (con las fechas) continua en la pagina siguiente, sin repetir el
+    nombre ahi -- caso real confirmado en produccion).
+    """
     candidates = []
     for page_num in range(len(doc)):
         page = doc[page_num]
-        name_matches = page.search_for(account_name)
         value_matches = page.search_for(target_value)
-        if not name_matches or not value_matches:
+        if not value_matches:
             continue
+
+        name_matches_same_page = page.search_for(account_name)
+        name_matches_prev_page = doc[page_num - 1].search_for(account_name) if page_num > 0 else []
+
         bureau_x_range = None
         if bureau_hint:
             bureau_matches = page.search_for(bureau_hint)
             if len(bureau_matches) == 1:
-                # columna del buro: desde su encabezado hasta un margen razonable a la derecha
                 bx = bureau_matches[0]
                 bureau_x_range = (bx.x0 - 10, bx.x0 + 140)
-        for name_rect in name_matches:
-            for value_rect in value_matches:
+
+        for value_rect in value_matches:
+            in_bureau_column = (
+                bureau_x_range is not None
+                and bureau_x_range[0] <= value_rect.x0 <= bureau_x_range[1]
+            )
+            # Preferencia 1: nombre en la misma pagina, arriba del valor (misma tabla)
+            for name_rect in name_matches_same_page:
                 vdist = value_rect.y0 - name_rect.y0
                 if -20 <= vdist <= 500:
-                    in_bureau_column = (
-                        bureau_x_range is not None
-                        and bureau_x_range[0] <= value_rect.x0 <= bureau_x_range[1]
-                    )
-                    candidates.append((page_num, name_rect, value_rect, vdist, in_bureau_column))
+                    candidates.append((page_num, name_rect, value_rect, vdist, in_bureau_column, 'same_page'))
+            # Preferencia 2: nombre en la pagina anterior (cuenta que cruza page break)
+            if name_matches_prev_page:
+                for name_rect in name_matches_prev_page:
+                    candidates.append((page_num, name_rect, value_rect, 99999, in_bureau_column, 'prev_page'))
 
     if not candidates:
-        return None, None, None, 'NONE', 'No se encontro el nombre de cuenta y el valor juntos en ninguna pagina'
+        return None, None, None, 'NONE', 'No se encontro el nombre de cuenta y el valor juntos en la misma pagina ni en paginas consecutivas'
 
-    # Si se dio bureau_hint y exactamente un candidato cae dentro de esa columna, se usa ese
-    # directamente con confianza HIGH -- esto resuelve el caso comun de un mismo valor repetido
-    # en varias columnas de buro (ej. mismo balance en TU y EXP).
     if bureau_hint:
         in_column = [c for c in candidates if c[4]]
         if len(in_column) == 1:
-            page_num, name_rect, value_rect, _, _ = in_column[0]
-            return page_num, name_rect, value_rect, 'HIGH', None
+            page_num, name_rect, value_rect, _, _, source = in_column[0]
+            return page_num, name_rect, value_rect, 'HIGH', None, (source == 'same_page')
 
-    candidates.sort(key=lambda c: c[3])
-    best_page, best_name_rect, best_value_rect, _, _ = candidates[0]
+    # Prioriza same_page sobre prev_page, y dentro de cada grupo la menor distancia vertical
+    candidates.sort(key=lambda c: (0 if c[5] == 'same_page' else 1, c[3]))
+    best_page, best_name_rect, best_value_rect, _, _, best_source = candidates[0]
     same_page_count = sum(1 for c in candidates if c[0] == best_page)
 
     if same_page_count == 1:
@@ -121,21 +133,34 @@ def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hi
         confidence = 'LOW'
 
     reason = None if confidence == 'HIGH' else f'{same_page_count} posibles ubicaciones en la pagina {best_page + 1}, no se pudo confirmar con certeza cual es la correcta' + (' (bureau_hint no ayudo a desambiguar)' if bureau_hint else ' (considera agregar bureau_hint)')
-    return best_page, best_name_rect, best_value_rect, confidence, reason
+    return best_page, best_name_rect, best_value_rect, confidence, reason, (best_source == 'same_page')
 
 
-def crop_evidence_region(doc, page_num, name_rect, value_rect, dpi=200):
+def crop_evidence_region(doc, page_num, name_rect, value_rect, same_page=True, dpi=200):
     page = doc[page_num]
     highlight = page.add_highlight_annot(value_rect)
     highlight.set_colors(stroke=(1, 0.85, 0))
     highlight.update()
 
-    clip = fitz.Rect(
-        max(0, min(name_rect.x0, value_rect.x0) - 15),
-        max(0, name_rect.y0 - 8),
-        min(page.rect.width, max(name_rect.x1, value_rect.x1) + 260),
-        min(page.rect.height, value_rect.y1 + 20),
-    )
+    if same_page:
+        # nombre y valor en la misma pagina: recorte normal desde el nombre hasta el valor
+        clip = fitz.Rect(
+            max(0, min(name_rect.x0, value_rect.x0) - 15),
+            max(0, name_rect.y0 - 8),
+            min(page.rect.width, max(name_rect.x1, value_rect.x1) + 260),
+            min(page.rect.height, value_rect.y1 + 20),
+        )
+    else:
+        # el nombre de la cuenta esta en la pagina anterior (cuenta que cruza el page break) --
+        # las coordenadas Y de paginas distintas no son comparables, asi que se recorta desde
+        # el inicio de ESTA pagina (donde continua la tabla) hasta el valor, sin usar la
+        # posicion vertical del nombre.
+        clip = fitz.Rect(
+            max(0, value_rect.x0 - 200),
+            0,
+            min(page.rect.width, value_rect.x1 + 260),
+            min(page.rect.height, value_rect.y1 + 20),
+        )
     pix = page.get_pixmap(clip=clip, dpi=dpi)
     return pix
 
@@ -171,11 +196,11 @@ def build_evidence_package(req: BuildPackageRequest):
         crops = []
 
         for sub in item.sub_locations:
-            page_num, name_rect, value_rect, confidence, reason = find_account_value_pair(
+            page_num, name_rect, value_rect, confidence, reason, same_page = find_account_value_pair(
                 source_doc, sub.account_name, sub.target_value, sub.bureau_hint
             )
             if page_num is not None and confidence == 'HIGH':
-                pix = crop_evidence_region(source_doc, page_num, name_rect, value_rect)
+                pix = crop_evidence_region(source_doc, page_num, name_rect, value_rect, same_page=same_page)
                 crops.append((pix, sub, page_num + 1))
                 sub_results.append(LocatedSubResult(
                     label=sub.label, located=True, page=page_num + 1, confidence=confidence
