@@ -37,6 +37,11 @@ class SubLocation(BaseModel):
     # aparece impreso justo antes del valor. Necesario cuando el mismo valor se repite dentro de
     # la MISMA cuenta en varios campos distintos (caso real: Saldo, Credito alto y Vencido pueden
     # ser identicos). Cuando se da, solo se aceptan valores en la MISMA linea que esa etiqueta.
+    field_label_candidates: Optional[list[str]] = None  # variantes de field_label_text -- el
+    # mismo dato se llama distinto segun la plataforma de origen del reporte (ej. "Balance Owed"
+    # en SmartCredit vs "Saldo:"/"Balance:"/"Current Balance:" en otras). Se prueban TODAS: se
+    # acepta un valor que este en la misma linea que CUALQUIERA de las etiquetas candidatas. Se
+    # combina con field_label_text si ambos se proporcionan (no son mutuamente excluyentes).
     highlight_full_row: bool = False  # cuando el argumento no depende de aislar el valor de UN
     # buro especifico (ej. "esta cuenta aparece bajo mas de un nombre"), resalta toda la fila de
     # valores en vez de intentar desambiguar por columna de buro. Requiere field_label_text.
@@ -83,7 +88,43 @@ class BuildPackageResponse(BaseModel):
 
 # ── Localizacion determinística ─────────────────────────────────────────
 
-def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hint: Optional[str] = None, account_number: Optional[str] = None, field_label_text: Optional[str] = None):
+BUREAU_NAMES = ["TransUnion", "Experian", "Equifax"]
+
+
+def _bureau_x_ranges_near(page, ref_y0: float, max_dist: float = 500):
+    """
+    Ubica el renglon de encabezados TransUnion / Experian / Equifax mas cercano hacia abajo de
+    ref_y0 (tipicamente el nombre de la cuenta), agrupando por renglon (mismo y0, tolerancia
+    3pt) y quedandose con el renglon que tenga MAS burós encontrados juntos (idealmente los 3).
+    Devuelve {nombre_buro: (x_min, x_max)} calculando los limites de columna como el PUNTO MEDIO
+    entre encabezados vecinos -- no un offset fijo en pixeles, que varia segun la plataforma de
+    origen del reporte y en la practica no coincide con donde cae el valor real (confirmado con
+    datos reales: el valor puede caer 40-50pt a la izquierda del inicio del texto del encabezado).
+    """
+    found = []
+    for bureau in BUREAU_NAMES:
+        for r in page.search_for(bureau):
+            if 0 <= r.y0 - ref_y0 <= max_dist:
+                found.append((bureau, r))
+    if not found:
+        return {}
+
+    rows = {}
+    for b, r in found:
+        key = round(r.y0 / 3)
+        rows.setdefault(key, []).append((b, r))
+    best_row = max(rows.values(), key=len)
+    best_row.sort(key=lambda br: br[1].x0)
+
+    ranges = {}
+    for i, (b, r) in enumerate(best_row):
+        left = (best_row[i - 1][1].x1 + r.x0) / 2 if i > 0 else r.x0 - 80
+        right = (best_row[i + 1][1].x0 + r.x1) / 2 if i < len(best_row) - 1 else r.x1 + 80
+        ranges[b] = (left, right)
+    return ranges
+
+
+def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hint: Optional[str] = None, account_number: Optional[str] = None, field_label_text: Optional[str] = None, field_label_candidates: Optional[list] = None):
     """
     Busca target_value en cada pagina, y busca el ancla en esa MISMA pagina o en la pagina
     ANTERIOR (las cuentas frecuentemente empiezan con su nombre/numero en una pagina y su tabla
@@ -92,18 +133,19 @@ def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hi
     que un nombre corto como "BCN"/"NCB" que puede repetirse muchas veces en una pagina con
     tablas de historial de pago), o account_name en su defecto.
 
-    Si field_label_text se proporciona (ej. "Saldo:"), se descartan los value_matches que no
-    esten en la MISMA linea que esa etiqueta -- necesario cuando varios campos de la MISMA
-    cuenta comparten el mismo valor (caso real confirmado: Saldo, Credito alto y Vencido pueden
-    ser identicos dentro de una sola cuenta).
+    Si field_label_text y/o field_label_candidates se proporcionan (ej. "Saldo:", "Balance Owed"),
+    se descartan los value_matches que no esten en la MISMA linea que AL MENOS UNA de esas
+    etiquetas -- necesario cuando varios campos de la MISMA cuenta comparten el mismo valor (caso
+    real confirmado: Saldo, Credito alto y Vencido pueden ser identicos dentro de una sola cuenta)
+    y cuando la etiqueta exacta varia segun la plataforma de origen del reporte.
     """
-    # NOTA: account_number NO se usa como ancla principal por defecto -- en el caso real que
-    # motivo agregarlo (BCN/NCB) el numero de cuenta es COMPARTIDO entre las dos entradas
-    # (justamente porque se investiga si son la misma deuda), asi que usarlo como ancla las
-    # confunde entre si. El nombre de cuenta SI las distingue bien y ya funciona (confirmado
-    # con JPMCB/SANTANDER). account_number queda disponible para casos futuros donde sea
-    # genuinamente mas especifico que el nombre, pero no reemplaza el nombre por defecto.
-    anchor_text = account_name
+    anchor_text = account_number if account_number else account_name
+    label_variants = []
+    if field_label_text:
+        label_variants.append(field_label_text)
+    if field_label_candidates:
+        label_variants.extend(c for c in field_label_candidates if c not in label_variants)
+
     candidates = []
     for page_num in range(len(doc)):
         page = doc[page_num]
@@ -111,8 +153,10 @@ def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hi
         if not value_matches:
             continue
 
-        if field_label_text:
-            label_matches = page.search_for(field_label_text)
+        if label_variants:
+            label_matches = []
+            for lbl in label_variants:
+                label_matches.extend(page.search_for(lbl))
             if label_matches:
                 value_matches = [
                     v for v in value_matches
@@ -124,28 +168,21 @@ def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hi
         name_matches_same_page = page.search_for(anchor_text)
         name_matches_prev_page = doc[page_num - 1].search_for(anchor_text) if page_num > 0 else []
 
-        bureau_x_range = None
-        if bureau_hint:
-            bureau_matches = page.search_for(bureau_hint)
-            if len(bureau_matches) == 1:
-                bx = bureau_matches[0]
-                bureau_x_range = (bx.x0 - 10, bx.x0 + 140)
-
-
         for value_rect in value_matches:
-            in_bureau_column = (
-                bureau_x_range is not None
-                and bureau_x_range[0] <= value_rect.x0 <= bureau_x_range[1]
-            )
             # Preferencia 1: nombre en la misma pagina, arriba del valor (misma tabla)
             for name_rect in name_matches_same_page:
                 vdist = value_rect.y0 - name_rect.y0
                 if -20 <= vdist <= 500:
+                    in_bureau_column = False
+                    if bureau_hint:
+                        ranges = _bureau_x_ranges_near(page, name_rect.y0)
+                        rng = ranges.get(bureau_hint)
+                        in_bureau_column = rng is not None and rng[0] <= value_rect.x0 <= rng[1]
                     candidates.append((page_num, name_rect, value_rect, vdist, in_bureau_column, 'same_page'))
             # Preferencia 2: nombre en la pagina anterior (cuenta que cruza page break)
             if name_matches_prev_page:
                 for name_rect in name_matches_prev_page:
-                    candidates.append((page_num, name_rect, value_rect, 99999, in_bureau_column, 'prev_page'))
+                    candidates.append((page_num, name_rect, value_rect, 99999, False, 'prev_page'))
 
     if not candidates:
         return None, None, None, 'NONE', 'No se encontro el nombre de cuenta y el valor juntos en la misma pagina ni en paginas consecutivas'
@@ -337,7 +374,7 @@ def build_evidence_package(req: BuildPackageRequest):
                 continue
 
             page_num, name_rect, value_rect, confidence, reason, same_page = find_account_value_pair(
-                source_doc, sub.account_name, sub.target_value, sub.bureau_hint, sub.account_number, sub.field_label_text
+                source_doc, sub.account_name, sub.target_value, sub.bureau_hint, sub.account_number, sub.field_label_text, sub.field_label_candidates
             )
             if page_num is not None and confidence == 'HIGH':
                 pix = crop_evidence_region(source_doc, page_num, name_rect, value_rect, same_page=same_page)
