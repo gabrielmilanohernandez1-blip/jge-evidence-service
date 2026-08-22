@@ -90,6 +90,55 @@ class BuildPackageResponse(BaseModel):
 
 BUREAU_NAMES = ["TransUnion", "Experian", "Equifax"]
 
+# Limite empirico para candidatos en la MISMA pagina (calibrado con 3 reportes reales:
+# SmartCredit, IdentityIQ, MyFreeScoreNow). Una fila de tabla real no separa etiqueta y valor
+# por mas de esto en ninguna de las 3 plataformas probadas.
+SAME_PAGE_MAX_VDIST = 300
+
+# Limite de respaldo para candidatos de PAGINA ANTERIOR cuando el ancla (account_name /
+# account_number) NO es unica en todo el documento -- ver _is_unique_anchor. Se probo como
+# limite fijo universal (valor que "resuelve" el caso ambiguo de IdentityIQ) pero un reporte de
+# MyFreeScoreNow con una seccion de recap ("Payment Summary") antes de la tabla real empuja los
+# valores legitimos de una cuenta que SI cruza el corte de pagina mas alla de cualquier limite
+# fijo razonable -- no hay un numero que sirva para las 3 plataformas a la vez. Por eso ya no es
+# el unico filtro: solo se aplica cuando el ancla es ambigua (ver mas abajo).
+PREV_PAGE_MAX_Y = 300
+
+
+def _is_unique_anchor(doc, anchor_text: str) -> bool:
+    """
+    True si anchor_text aparece EXACTAMENTE UNA VEZ en TODO el documento. Cuando esto es cierto,
+    cualquier coincidencia de anchor_text en la pagina anterior es, por definicion, la cuenta
+    correcta -- sin importar que tan lejos este el valor en la pagina siguiente (una cuenta puede
+    legitimamente extenderse varios cientos de puntos si el layout de esa plataforma intercala
+    tablas de resumen antes de los datos detallados). Cuando el ancla SI se repite en el
+    documento (caso real: "NCB" tambien aparece dentro de un comentario "Vendido a: NCB
+    MANAGEMENT" de OTRA cuenta), no hay forma de confirmar sin ambiguedad que la ocurrencia de la
+    pagina anterior es la cuenta real -- ahi se vuelve a exigir el limite PREV_PAGE_MAX_Y como
+    filtro de seguridad, y si aun asi no alcanza, se reporta como ambiguo (MEDIUM/REVIEW_REQUIRED)
+    en vez de adivinar. Esto mantiene el principio del proyecto: preferir REVIEW_REQUIRED antes
+    que una captura incorrecta, sin sacrificar los casos legitimos que SI tienen un ancla unica.
+
+    NOTA: se probo tambien filtrar aqui las coincidencias que "parecen" mencion incidental
+    (ej. contar cuantas palabras preceden al ancla en su linea, para distinguir un encabezado
+    real de un comentario tipo "Vendido a: NCB MANAGEMENT") -- se descarto porque el mismo patron
+    estructural (2 palabras + dos puntos antes del ancla) tambien aparece en etiquetas de campo
+    completamente legitimas y comunes en los 3 reportes (ej. "Cuenta #: 42668417****"), asi que
+    ese filtro rechazaba anclas reales tan seguido como rechazaba las incidentales -- no
+    discrimina. Sin una señal geometrica/textual que sí discrimine de forma confiable, se cuentan
+    TODAS las coincidencias literales; el efecto practico es que un ancla que colisiona con una
+    mencion incidental dentro del documento (caso real: "NCB") no calificara como unica, y su
+    candidato de pagina anterior queda sujeto al limite PREV_PAGE_MAX_Y como red de seguridad --
+    en el peor caso, resulta en MEDIUM/REVIEW_REQUIRED en vez de HIGH, nunca en una captura
+    incorrecta.
+    """
+    count = 0
+    for page_num in range(len(doc)):
+        count += len(doc[page_num].search_for(anchor_text))
+        if count > 1:
+            return False
+    return count == 1
+
 
 def _bureau_x_ranges_near(page, ref_y0: float, max_dist: float = 500):
     """
@@ -100,11 +149,21 @@ def _bureau_x_ranges_near(page, ref_y0: float, max_dist: float = 500):
     entre encabezados vecinos -- no un offset fijo en pixeles, que varia segun la plataforma de
     origen del reporte y en la practica no coincide con donde cae el valor real (confirmado con
     datos reales: el valor puede caer 40-50pt a la izquierda del inicio del texto del encabezado).
+
+    Busca en AMBAS direcciones (arriba y abajo de ref_y0), no solo hacia abajo. ref_y0 es el y0
+    del ancla usada (account_name o account_number segun cual se haya pasado) -- y cuando el
+    ancla es account_number, su fila esta casi siempre POR DEBAJO del renglon de encabezados de
+    buro (el encabezado "TransUnion/Experian/Equifax" viene primero, el numero de cuenta debajo),
+    al reves de cuando el ancla es account_name (que tipicamente esta arriba del encabezado de
+    buro). Restringir la busqueda a una sola direccion causaba que, con account_number como
+    ancla, nunca se encontrara el renglon de encabezados -- caso real confirmado (SmartCredit,
+    Capital One #515676: bureau_hint quedaba sin efecto y la deteccion caia a MEDIUM/LOW en vez
+    de HIGH).
     """
     found = []
     for bureau in BUREAU_NAMES:
         for r in page.search_for(bureau):
-            if 0 <= r.y0 - ref_y0 <= max_dist:
+            if abs(r.y0 - ref_y0) <= max_dist:
                 found.append((bureau, r))
     if not found:
         return {}
@@ -140,6 +199,7 @@ def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hi
     y cuando la etiqueta exacta varia segun la plataforma de origen del reporte.
     """
     anchor_text = account_number if account_number else account_name
+    anchor_is_unique = _is_unique_anchor(doc, anchor_text)
     label_variants = []
     if field_label_text:
         label_variants.append(field_label_text)
@@ -172,15 +232,25 @@ def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hi
             # Preferencia 1: nombre en la misma pagina, arriba del valor (misma tabla)
             for name_rect in name_matches_same_page:
                 vdist = value_rect.y0 - name_rect.y0
-                if -20 <= vdist <= 500:
+                if -20 <= vdist <= SAME_PAGE_MAX_VDIST:
                     in_bureau_column = False
                     if bureau_hint:
                         ranges = _bureau_x_ranges_near(page, name_rect.y0)
                         rng = ranges.get(bureau_hint)
                         in_bureau_column = rng is not None and rng[0] <= value_rect.x0 <= rng[1]
                     candidates.append((page_num, name_rect, value_rect, vdist, in_bureau_column, 'same_page'))
-            # Preferencia 2: nombre en la pagina anterior (cuenta que cruza page break)
-            if name_matches_prev_page:
+            # Preferencia 2: nombre en la pagina anterior (cuenta que cruza page break). Si el
+            # ancla es UNICA en todo el documento, se acepta sin importar la distancia -- no hay
+            # otra cuenta con la que se pueda estar confundiendo (caso real confirmado: cuentas de
+            # MyFreeScoreNow con una tabla de resumen "Payment Summary" antes de los datos reales,
+            # que empuja el valor cientos de puntos mas abajo en la pagina siguiente). Si el ancla
+            # SI se repite en el documento, se exige que el valor este cerca del INICIO de esta
+            # pagina como filtro de seguridad -- sin esto, un nombre que aparece de pasada en un
+            # comentario de OTRA cuenta (ej. "Vendido a: NCB MANAGEMENT" dentro de los comentarios
+            # de una cuenta Santander) se emparejaba con CUALQUIER valor que matcheara en la
+            # pagina siguiente, sin importar que tan lejos estuviera -- caso real confirmado
+            # (JPMCB/NCB, reporte IdentityIQ de Rangel Peñaranda).
+            if name_matches_prev_page and (anchor_is_unique or value_rect.y0 <= PREV_PAGE_MAX_Y):
                 for name_rect in name_matches_prev_page:
                     candidates.append((page_num, name_rect, value_rect, 99999, False, 'prev_page'))
 
@@ -189,14 +259,31 @@ def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hi
 
     if bureau_hint:
         in_column = [c for c in candidates if c[4]]
-        if len(in_column) == 1:
-            page_num, name_rect, value_rect, _, _, source = in_column[0]
+        # Igual que mas abajo: deduplicar por VALOR, no por par (ancla, valor). Cuando el ancla
+        # (tipicamente account_number) se imprime identico bajo mas de una columna de buro en la
+        # misma fila (caso real: TransUnion y Experian muestran el mismo numero de cuenta
+        # enmascarado), un solo valor real en la columna correcta genera un candidato "in_column"
+        # por cada copia del ancla -- sin deduplicar, len(in_column) nunca da 1 y un match
+        # completamente inequivoco terminaba en MEDIUM (caso real confirmado: SmartCredit,
+        # Capital One #515676, Balance Owed).
+        distinct_in_column = {}
+        for c in in_column:
+            key = (round(c[2].x0, 1), round(c[2].y0, 1))
+            distinct_in_column.setdefault(key, c)
+        if len(distinct_in_column) == 1:
+            page_num, name_rect, value_rect, _, _, source = next(iter(distinct_in_column.values()))
             return page_num, name_rect, value_rect, 'HIGH', None, (source == 'same_page')
 
     # Prioriza same_page sobre prev_page, y dentro de cada grupo la menor distancia vertical
     candidates.sort(key=lambda c: (0 if c[5] == 'same_page' else 1, c[3]))
     best_page, best_name_rect, best_value_rect, _, _, best_source = candidates[0]
-    same_page_count = sum(1 for c in candidates if c[0] == best_page)
+    # Cuenta VALORES distintos en la pagina, no pares (ancla, valor). El mismo account_number
+    # suele imprimirse identico bajo mas de una columna de buro (ej. TransUnion y Experian
+    # muestran el mismo numero enmascarado) -- eso genera varios name_rect para UN solo
+    # value_rect real, y contar pares infla la ambiguedad de forma artificial (caso real
+    # confirmado: JPMCB, reporte IdentityIQ -- un unico valor candidato bajaba a MEDIUM solo
+    # porque su ancla aparecia 2 veces en la pagina anterior).
+    same_page_count = len({(round(c[2].x0, 1), round(c[2].y0, 1)) for c in candidates if c[0] == best_page})
 
     if same_page_count == 1:
         confidence = 'HIGH'
@@ -222,6 +309,7 @@ def find_full_row_evidence(doc, account_name: str, field_label_text: str):
     califica -- si mas de una pagina tiene una coincidencia valida, es ambiguo y se reporta
     como tal en vez de adivinar cual es la correcta.
     """
+    anchor_is_unique = _is_unique_anchor(doc, account_name)
     page_candidates = []  # una entrada por pagina que tenga al menos un candidato valido
 
     for page_num in range(len(doc)):
@@ -237,9 +325,9 @@ def find_full_row_evidence(doc, account_name: str, field_label_text: str):
         for label_rect in label_matches:
             for name_rect in name_matches_same_page:
                 vdist = label_rect.y0 - name_rect.y0
-                if -20 <= vdist <= 500:
+                if -20 <= vdist <= SAME_PAGE_MAX_VDIST:
                     candidates.append((label_rect, vdist, 'same_page'))
-            if name_matches_prev_page:
+            if name_matches_prev_page and (anchor_is_unique or label_rect.y0 <= PREV_PAGE_MAX_Y):
                 candidates.append((label_rect, 99999, 'prev_page'))
 
         if not candidates:
