@@ -42,6 +42,10 @@ class SubLocation(BaseModel):
     # en SmartCredit vs "Saldo:"/"Balance:"/"Current Balance:" en otras). Se prueban TODAS: se
     # acepta un valor que este en la misma linea que CUALQUIERA de las etiquetas candidatas. Se
     # combina con field_label_text si ambos se proporcionan (no son mutuamente excluyentes).
+    target_value_alternatives: Optional[list[str]] = None  # variantes de formato de target_value
+    # (ej. "0.00" cuando target_value es "$0.00") -- el mismo n8n manifest ya las genera pero
+    # este modelo las descartaba en silencio (Pydantic ignora campos no declarados), asi que
+    # nunca se usaban en la busqueda real. Ver find_account_value_pair.
     highlight_full_row: bool = False  # cuando el argumento no depende de aislar el valor de UN
     # buro especifico (ej. "esta cuenta aparece bajo mas de un nombre"), resalta toda la fila de
     # valores en vez de intentar desambiguar por columna de buro. Requiere field_label_text.
@@ -183,7 +187,48 @@ def _bureau_x_ranges_near(page, ref_y0: float, max_dist: float = 500):
     return ranges
 
 
-def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hint: Optional[str] = None, account_number: Optional[str] = None, field_label_text: Optional[str] = None, field_label_candidates: Optional[list] = None):
+import re as _re
+
+
+def _date_format_alternatives(value: str) -> list:
+    """
+    Si value tiene forma de fecha ISO (YYYY-MM-DD, el formato que usa el pipeline de analisis
+    internamente), genera las variantes DD/MM/YYYY y MM/DD/YYYY -- el formato en que la fecha
+    realmente aparece IMPRESA en el PDF original. Sin esto, target_value="2023-10-16" nunca
+    hace match contra el texto real del reporte ("16/10/2023"), y CUALQUIER discrepancia de
+    fecha de apertura (un tipo de disputa muy comun) queda sin evidencia localizable aunque el
+    dato SI este presente y sea correcto. No inventa ni asume cual de las 2 variantes es la
+    real -- prueba ambas como candidatas de busqueda, igual que target_value_alternatives.
+    """
+    m = _re.match(r'^(\d{4})-(\d{2})-(\d{2})$', str(value or '').strip())
+    if not m:
+        return []
+    yyyy, mm, dd = m.group(1), m.group(2), m.group(3)
+    return [f'{dd}/{mm}/{yyyy}', f'{mm}/{dd}/{yyyy}']
+
+
+def _amount_format_alternatives(value: str) -> list:
+    """
+    Si value tiene forma de monto en formato US ("$1,234.56", "$0.00"), genera las variantes en
+    formato europeo que estas plataformas usan en algunas secciones del MISMO PDF (separador de
+    miles y decimales invertidos, simbolo de moneda al final -- ej. "1.234,56 $", "0,00 $", y la
+    variante con espacio como separador de miles vista en este mismo reporte: "8 633,00 $"). Sin
+    esto, un balance identico puede no encontrarse solo porque esa seccion en particular del PDF
+    lo imprime con el formato "opuesto" al que usa el analyzer internamente (Leccion aprendida
+    #2 del proyecto: "el mismo PDF puede usar formatos de numero distintos en secciones
+    distintas").
+    """
+    m = _re.match(r'^\$?\s*([\d,]*\d)\.(\d{2})$', str(value or '').strip())
+    if not m:
+        return []
+    whole, cents = m.group(1), m.group(2)
+    return [
+        f'{whole.replace(",", ".")},{cents} $',
+        f'{whole.replace(",", " ")},{cents} $',
+    ]
+
+
+def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hint: Optional[str] = None, account_number: Optional[str] = None, field_label_text: Optional[str] = None, field_label_candidates: Optional[list] = None, target_value_alternatives: Optional[list] = None):
     """
     Busca target_value en cada pagina, y busca el ancla en esa MISMA pagina o en la pagina
     ANTERIOR (las cuentas frecuentemente empiezan con su nombre/numero en una pagina y su tabla
@@ -206,10 +251,25 @@ def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hi
     if field_label_candidates:
         label_variants.extend(c for c in field_label_candidates if c not in label_variants)
 
+    # Variantes de target_value a probar: el valor tal cual, las alternativas explicitas del
+    # manifest (ej. formato de numero "$0.00" vs "0.00"), y -- si target_value tiene forma de
+    # fecha ISO -- las variantes DD/MM/YYYY y MM/DD/YYYY (ver _date_format_alternatives). Se
+    # prueban TODAS por pagina y se combinan los matches; no importa cual variante hizo match,
+    # el rect encontrado es el mismo dato real impreso en el documento.
+    value_variants = [target_value]
+    if target_value_alternatives:
+        value_variants.extend(v for v in target_value_alternatives if v not in value_variants)
+    for alt in _date_format_alternatives(target_value) + _amount_format_alternatives(target_value):
+        if alt not in value_variants:
+            value_variants.append(alt)
+
     candidates = []
     for page_num in range(len(doc)):
         page = doc[page_num]
-        value_matches = page.search_for(target_value)
+        value_matches = []
+        for variant in value_variants:
+            for m in page.search_for(variant):
+                value_matches.append(m)
         if not value_matches:
             continue
 
@@ -255,7 +315,7 @@ def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hi
                     candidates.append((page_num, name_rect, value_rect, 99999, False, 'prev_page'))
 
     if not candidates:
-        return None, None, None, 'NONE', 'No se encontro el nombre de cuenta y el valor juntos en la misma pagina ni en paginas consecutivas'
+        return None, None, None, 'NONE', 'No se encontro el nombre de cuenta y el valor juntos en la misma pagina ni en paginas consecutivas', False
 
     if bureau_hint:
         in_column = [c for c in candidates if c[4]]
@@ -296,7 +356,7 @@ def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hi
     return best_page, best_name_rect, best_value_rect, confidence, reason, (best_source == 'same_page')
 
 
-def find_full_row_evidence(doc, account_name: str, field_label_text: str):
+def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[str] = None, field_label_candidates: Optional[list] = None):
     """
     Modo mas simple y robusto para casos donde no hace falta aislar el valor de UN buro
     especifico (ej. discrepancias sobre identidad de la cuenta, no sobre un dato puntual).
@@ -309,12 +369,22 @@ def find_full_row_evidence(doc, account_name: str, field_label_text: str):
     califica -- si mas de una pagina tiene una coincidencia valida, es ambiguo y se reporta
     como tal en vez de adivinar cual es la correcta.
     """
+    label_variants = []
+    if field_label_text:
+        label_variants.append(field_label_text)
+    if field_label_candidates:
+        label_variants.extend(c for c in field_label_candidates if c not in label_variants)
+    if not label_variants:
+        return None, None, None, None, 'find_full_row_evidence requiere field_label_text o field_label_candidates'
+
     anchor_is_unique = _is_unique_anchor(doc, account_name)
     page_candidates = []  # una entrada por pagina que tenga al menos un candidato valido
 
     for page_num in range(len(doc)):
         page = doc[page_num]
-        label_matches = page.search_for(field_label_text)
+        label_matches = []
+        for variant in label_variants:
+            label_matches.extend(page.search_for(variant))
         if not label_matches:
             continue
 
@@ -439,14 +509,14 @@ def build_evidence_package(req: BuildPackageRequest):
 
         for sub in item.sub_locations:
             if sub.highlight_full_row:
-                if not sub.field_label_text:
+                if not sub.field_label_text and not sub.field_label_candidates:
                     sub_results.append(LocatedSubResult(
                         label=sub.label, located=False, confidence='NONE',
-                        reason='highlight_full_row requiere field_label_text'
+                        reason='highlight_full_row requiere field_label_text o field_label_candidates'
                     ))
                     continue
                 page_num, label_rect, row_rect, same_page, fail_reason = find_full_row_evidence(
-                    source_doc, sub.account_name, sub.field_label_text
+                    source_doc, sub.account_name, sub.field_label_text, sub.field_label_candidates
                 )
                 if page_num is not None:
                     pix = crop_full_row(source_doc, page_num, label_rect, row_rect)
@@ -462,7 +532,7 @@ def build_evidence_package(req: BuildPackageRequest):
                 continue
 
             page_num, name_rect, value_rect, confidence, reason, same_page = find_account_value_pair(
-                source_doc, sub.account_name, sub.target_value, sub.bureau_hint, sub.account_number, sub.field_label_text, sub.field_label_candidates
+                source_doc, sub.account_name, sub.target_value, sub.bureau_hint, sub.account_number, sub.field_label_text, sub.field_label_candidates, sub.target_value_alternatives
             )
             if page_num is not None and confidence == 'HIGH':
                 pix = crop_evidence_region(source_doc, page_num, name_rect, value_rect, same_page=same_page)
