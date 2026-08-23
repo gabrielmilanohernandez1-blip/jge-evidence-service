@@ -410,11 +410,23 @@ def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[st
     if not page_candidates:
         return None, None, None, None, 'No se encontro el nombre de cuenta y la etiqueta de campo juntos en ninguna pagina'
 
-    if len(page_candidates) > 1:
-        pages_found = [p[0] + 1 for p in page_candidates]
+    # Prioriza same_page sobre prev_page, igual que find_account_value_pair -- una pagina con
+    # ancla Y etiqueta juntas en la MISMA pagina es una senal mucho mas fuerte que una pagina que
+    # solo califico por el fallback de "pagina anterior". Sin esto, un ancla unica en el
+    # documento (ej. "BCN") puede fallar como "ambiguo" solo porque una etiqueta generica como
+    # "Saldo:" tambien aparece cerca del inicio de la pagina SIGUIENTE perteneciendo en realidad
+    # a OTRA cuenta (caso real confirmado: BCN en pagina 5, tabla de JPMCB continua en pagina 6
+    # con su propio "Saldo:" cerca del encabezado) -- eso NO deberia invalidar el match directo y
+    # correcto que ya existe en la misma pagina. Solo se recurre a candidatos prev_page cuando
+    # NINGUNA pagina califico por same_page en todo el documento.
+    same_page_candidates = [p for p in page_candidates if p[2] == 'same_page']
+    effective_candidates = same_page_candidates if same_page_candidates else page_candidates
+
+    if len(effective_candidates) > 1:
+        pages_found = [p[0] + 1 for p in effective_candidates]
         return None, None, None, None, f'La combinacion de nombre de cuenta + etiqueta aparece en mas de una pagina ({pages_found}) -- no se puede confirmar cual es la correcta sin ambiguedad'
 
-    page_num, best_label_rect, source = page_candidates[0]
+    page_num, best_label_rect, source = effective_candidates[0]
     page = doc[page_num]
 
     # Ancho real de la fila: el borde derecho del ultimo texto que comparte la misma linea
