@@ -33,6 +33,16 @@ class SubLocation(BaseModel):
     account_number: Optional[str] = None  # ej. "101099****" -- cuando se da, se usa como ancla
     # PRINCIPAL en vez de account_name. Mas confiable que el nombre cuando el nombre es corto
     # (ej. "BCN", "NCB") y aparece muchas veces en tablas de historial de pago de la misma pagina.
+    account_name_alternatives: Optional[list[str]] = None  # variantes cortas/abreviadas de
+    # account_name -- necesario porque el nombre que el analisis de IA usa (normalizado, a veces
+    # el nombre legal completo del acreedor, ej. "NCB MANAGEMENT SERVICES") frecuentemente NO es
+    # el texto literal que aparece impreso como encabezado de la seccion de esa cuenta en el PDF
+    # (caso real confirmado, reporte de Rangel Peñaranda: el encabezado real es solo "NCB", igual
+    # que "SANTANDER" en vez de "SANTANDER CONSUMER USA"). Se prueban TODAS como candidatas de
+    # ancla, igual que target_value_alternatives. Ver tambien _is_reference_mention: el nombre
+    # completo suele SI aparecer en el documento, pero como referencia dentro de OTRA cuenta
+    # (ej. "NCB (Acreedor original: ... SANTANDER CONSUMER USA INC)"), nunca como encabezado
+    # propio -- de ahi que haga falta la forma corta ademas del filtro de mencion-referencial.
     field_label_text: Optional[str] = None  # ej. "Saldo:" -- texto EXACTO de la etiqueta tal como
     # aparece impreso justo antes del valor. Necesario cuando el mismo valor se repite dentro de
     # la MISMA cuenta en varios campos distintos (caso real: Saldo, Credito alto y Vencido pueden
@@ -144,6 +154,56 @@ def _is_unique_anchor(doc, anchor_text: str) -> bool:
     return count == 1
 
 
+# Frases que indican que el nombre encontrado justo despues es una REFERENCIA a otro acreedor
+# (historial de venta/transferencia de deuda), no el encabezado de su propia seccion de cuenta.
+# Caso real confirmado (Rangel Peñaranda, reporte IdentityIQ): "SANTANDER CONSUMER USA" aparece
+# UNA sola vez en todo el documento, dentro del encabezado de la cuenta NCB: "NCB (Acreedor
+# original: 14 SANTANDER CONSUMER USA INC)". Usar esa ocurrencia como ancla de Santander
+# encontraba el Saldo: real de NCB (pagina siguiente) y lo entregaba como evidencia de Santander
+# -- HIGH confidence, pagina y cuenta EQUIVOCADAS. Simetricamente, "NCB" aparece dentro de los
+# comentarios de la propia cuenta Santander ("...Saldo impagado reportado como Vendido a: NCB
+# MANAGEMENT") y por la misma razon podia capturar el Saldo: de OTRA cuenta (STARTAUTOF, que
+# empieza mas abajo en esa misma pagina) etiquetado como si fuera de NCB.
+# NOTA: ya se probo (ver docstring de _is_unique_anchor) un filtro estructural generico basado en
+# "N palabras + dos puntos antes del ancla" y se descarto por rechazar anclas reales igual de
+# seguido (ej. "Cuenta #:"). Esta lista es deliberadamente mas angosta -- frases especificas de
+# venta/transferencia de deuda, no un patron estructural -- para no repetir ese problema.
+REFERENCE_MENTION_MARKERS = [
+    'acreedor original', 'original creditor', 'vendido a', 'sold to',
+    'comprado por', 'purchased by', 'transferido a', 'assigned to',
+]
+
+
+def _is_reference_mention(page, rect) -> bool:
+    """
+    True si el texto inmediatamente antes de `rect` en la misma linea contiene una de las frases
+    de REFERENCE_MENTION_MARKERS -- es decir, el nombre encontrado en `rect` esta siendo
+    mencionado como el acreedor ORIGINAL/ANTERIOR de OTRA cuenta, no como el encabezado de su
+    propia seccion. Se usa para descartar esas ocurrencias como ancla antes de emparejarlas con
+    un valor/etiqueta cercano.
+    """
+    preceding_rect = fitz.Rect(max(0, rect.x0 - 220), rect.y0 - 2, rect.x0, rect.y1 + 2)
+    preceding_text = page.get_textbox(preceding_rect).lower()
+    return any(marker in preceding_text for marker in REFERENCE_MENTION_MARKERS)
+
+
+def _name_candidates(account_name: str, account_name_alternatives: Optional[list] = None) -> list:
+    names = [account_name]
+    if account_name_alternatives:
+        names.extend(n for n in account_name_alternatives if n and n not in names)
+    return names
+
+
+def _search_name_filtered(page, names: list) -> list:
+    """search_for cada candidato de nombre en `page`, descartando menciones referenciales."""
+    matches = []
+    for name in names:
+        for r in page.search_for(name):
+            if not _is_reference_mention(page, r):
+                matches.append(r)
+    return matches
+
+
 def _bureau_x_ranges_near(page, ref_y0: float, max_dist: float = 500):
     """
     Ubica el renglon de encabezados TransUnion / Experian / Equifax mas cercano hacia abajo de
@@ -228,7 +288,7 @@ def _amount_format_alternatives(value: str) -> list:
     ]
 
 
-def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hint: Optional[str] = None, account_number: Optional[str] = None, field_label_text: Optional[str] = None, field_label_candidates: Optional[list] = None, target_value_alternatives: Optional[list] = None):
+def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hint: Optional[str] = None, account_number: Optional[str] = None, field_label_text: Optional[str] = None, field_label_candidates: Optional[list] = None, target_value_alternatives: Optional[list] = None, account_name_alternatives: Optional[list] = None):
     """
     Busca target_value en cada pagina, y busca el ancla en esa MISMA pagina o en la pagina
     ANTERIOR (las cuentas frecuentemente empiezan con su nombre/numero en una pagina y su tabla
@@ -243,8 +303,21 @@ def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hi
     real confirmado: Saldo, Credito alto y Vencido pueden ser identicos dentro de una sola cuenta)
     y cuando la etiqueta exacta varia segun la plataforma de origen del reporte.
     """
-    anchor_text = account_number if account_number else account_name
-    anchor_is_unique = _is_unique_anchor(doc, anchor_text)
+    using_account_number = bool(account_number)
+    anchor_text = account_number if using_account_number else account_name
+    anchor_names = _name_candidates(account_name, account_name_alternatives)
+    if using_account_number:
+        anchor_is_unique = _is_unique_anchor(doc, anchor_text)
+    else:
+        # Unico si, sumando TODOS los nombres candidatos (account_name + alternativas) y
+        # descartando menciones referenciales (ver _is_reference_mention), aparece una sola vez
+        # en todo el documento.
+        total = 0
+        for pn in range(len(doc)):
+            total += len(_search_name_filtered(doc[pn], anchor_names))
+            if total > 1:
+                break
+        anchor_is_unique = total == 1
     label_variants = []
     if field_label_text:
         label_variants.append(field_label_text)
@@ -285,8 +358,12 @@ def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hi
             if not value_matches:
                 continue
 
-        name_matches_same_page = page.search_for(anchor_text)
-        name_matches_prev_page = doc[page_num - 1].search_for(anchor_text) if page_num > 0 else []
+        if using_account_number:
+            name_matches_same_page = page.search_for(anchor_text)
+            name_matches_prev_page = doc[page_num - 1].search_for(anchor_text) if page_num > 0 else []
+        else:
+            name_matches_same_page = _search_name_filtered(page, anchor_names)
+            name_matches_prev_page = _search_name_filtered(doc[page_num - 1], anchor_names) if page_num > 0 else []
 
         for value_rect in value_matches:
             # Preferencia 1: nombre en la misma pagina, arriba del valor (misma tabla)
@@ -356,7 +433,7 @@ def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hi
     return best_page, best_name_rect, best_value_rect, confidence, reason, (best_source == 'same_page')
 
 
-def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[str] = None, field_label_candidates: Optional[list] = None):
+def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[str] = None, field_label_candidates: Optional[list] = None, account_name_alternatives: Optional[list] = None):
     """
     Modo mas simple y robusto para casos donde no hace falta aislar el valor de UN buro
     especifico (ej. discrepancias sobre identidad de la cuenta, no sobre un dato puntual).
@@ -377,7 +454,13 @@ def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[st
     if not label_variants:
         return None, None, None, None, 'find_full_row_evidence requiere field_label_text o field_label_candidates'
 
-    anchor_is_unique = _is_unique_anchor(doc, account_name)
+    anchor_names = _name_candidates(account_name, account_name_alternatives)
+    total = 0
+    for pn in range(len(doc)):
+        total += len(_search_name_filtered(doc[pn], anchor_names))
+        if total > 1:
+            break
+    anchor_is_unique = total == 1
     page_candidates = []  # una entrada por pagina que tenga al menos un candidato valido
 
     for page_num in range(len(doc)):
@@ -388,8 +471,8 @@ def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[st
         if not label_matches:
             continue
 
-        name_matches_same_page = page.search_for(account_name)
-        name_matches_prev_page = doc[page_num - 1].search_for(account_name) if page_num > 0 else []
+        name_matches_same_page = _search_name_filtered(page, anchor_names)
+        name_matches_prev_page = _search_name_filtered(doc[page_num - 1], anchor_names) if page_num > 0 else []
 
         candidates = []
         for label_rect in label_matches:
@@ -528,7 +611,7 @@ def build_evidence_package(req: BuildPackageRequest):
                     ))
                     continue
                 page_num, label_rect, row_rect, same_page, fail_reason = find_full_row_evidence(
-                    source_doc, sub.account_name, sub.field_label_text, sub.field_label_candidates
+                    source_doc, sub.account_name, sub.field_label_text, sub.field_label_candidates, sub.account_name_alternatives
                 )
                 if page_num is not None:
                     pix = crop_full_row(source_doc, page_num, label_rect, row_rect)
@@ -544,7 +627,7 @@ def build_evidence_package(req: BuildPackageRequest):
                 continue
 
             page_num, name_rect, value_rect, confidence, reason, same_page = find_account_value_pair(
-                source_doc, sub.account_name, sub.target_value, sub.bureau_hint, sub.account_number, sub.field_label_text, sub.field_label_candidates, sub.target_value_alternatives
+                source_doc, sub.account_name, sub.target_value, sub.bureau_hint, sub.account_number, sub.field_label_text, sub.field_label_candidates, sub.target_value_alternatives, sub.account_name_alternatives
             )
             if page_num is not None and confidence == 'HIGH':
                 pix = crop_evidence_region(source_doc, page_num, name_rect, value_rect, same_page=same_page)
