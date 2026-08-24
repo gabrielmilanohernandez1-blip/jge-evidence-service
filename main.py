@@ -119,6 +119,39 @@ SAME_PAGE_MAX_VDIST = 300
 PREV_PAGE_MAX_Y = 300
 
 
+# ── Formato del PDF de salida (margenes, tipografia, paginacion) ────────
+# Estandar de documento legal de 1 pulgada de margen en los 4 lados (612x792pt = carta US),
+# titulos centrados en negrita, numeracion de pagina y encabezado repetido en cada pagina de
+# evidencia -- antes todo el texto se insertaba a mano en x=50 fijo (menos de 1 pulgada), sin
+# limite de ancho para las imagenes (podian salirse del margen derecho) y sin numeracion ni
+# encabezado de continuidad -- reportado por Gabriel como "no esta justificado, no esta
+# alineado" (Ronda 17).
+PAGE_W, PAGE_H = 612, 792
+MARGIN = 72  # 1 pulgada
+CONTENT_W = PAGE_W - 2 * MARGIN
+FOOTER_SPACE = 24
+
+
+def _centered_x(text: str, fontsize: float, fontname: str = "helv", page_width: float = PAGE_W) -> float:
+    """x0 para que `text` quede centrado horizontalmente en la pagina."""
+    w = fitz.get_text_length(text, fontname=fontname, fontsize=fontsize)
+    return max(MARGIN, (page_width - w) / 2)
+
+
+def _new_evidence_page(output_doc, client_name: str, continuation: bool = False):
+    """
+    Crea una pagina de evidencia nueva con el encabezado repetido (cliente + nombre del
+    paquete) en la esquina superior -- practica estandar en anexos legales de mas de 1 pagina,
+    para que una pagina no quede huerfana/sin identificar si se separa del resto del paquete al
+    imprimirse o archivarse por separado.
+    """
+    page = output_doc.new_page(width=PAGE_W, height=PAGE_H)
+    suffix = " (cont.)" if continuation else ""
+    header = f"{client_name} — CFPB Supporting Evidence{suffix}"
+    page.insert_text((MARGIN, 40), header, fontsize=8, fontname="helv", color=(0.45, 0.45, 0.45))
+    return page
+
+
 def _is_unique_anchor(doc, anchor_text: str) -> bool:
     """
     True si anchor_text aparece EXACTAMENTE UNA VEZ en TODO el documento. Cuando esto es cierto,
@@ -527,6 +560,46 @@ def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[st
     return page_num, best_label_rect, row_rect, (source == 'same_page'), None
 
 
+def _row_extent(page, y0, tolerance=3.0):
+    """
+    Extremos horizontales reales del texto impreso en la fila de y0 (tolerancia en pt),
+    escaneando todas las palabras de la pagina -- mismo principio ya usado para row_right_edge
+    en find_full_row_evidence: nunca usar un margen fijo en puntos para delimitar una fila, no
+    generaliza entre plataformas de origen del reporte ni entre columnas de distinto ancho.
+    """
+    words = page.get_text("words")
+    xs0, xs1 = [], []
+    for w in words:
+        wx0, wy0, wx1, wy1 = w[0], w[1], w[2], w[3]
+        if abs(wy0 - y0) <= tolerance:
+            xs0.append(wx0)
+            xs1.append(wx1)
+    if not xs0:
+        return None, None
+    return min(xs0), max(xs1)
+
+
+def _row_top_boundary(page, y0, lookback=40, margin=6):
+    """
+    Limite superior real para un recorte que empieza en la fila de y0: busca la fila de texto
+    distinta INMEDIATAMENTE ANTERIOR (y1 < y0) dentro de `lookback` puntos hacia arriba y
+    devuelve un punto justo debajo de ella -- evita que el recorte capture la mitad inferior de
+    la fila anterior (caso real confirmado: "Fecha de apertura:" apareciendo cortada a la mitad
+    arriba de "Saldo:" en el modo full-row, Ronda 16). Si no hay fila anterior cercana, usa el
+    margen fijo pequeño de siempre.
+    """
+    words = page.get_text("words")
+    prev_y1 = None
+    for w in words:
+        wy1 = w[3]
+        if wy1 < y0 - 1 and (y0 - wy1) <= lookback:
+            if prev_y1 is None or wy1 > prev_y1:
+                prev_y1 = wy1
+    if prev_y1 is not None:
+        return min(y0, prev_y1 + margin)
+    return max(0, y0 - 8)
+
+
 def crop_full_row(doc, page_num, label_rect, row_rect, dpi=200):
     page = doc[page_num]
     highlight = page.add_highlight_annot(row_rect)
@@ -535,7 +608,7 @@ def crop_full_row(doc, page_num, label_rect, row_rect, dpi=200):
 
     clip = fitz.Rect(
         max(0, label_rect.x0 - 15),
-        max(0, label_rect.y0 - 8),
+        _row_top_boundary(page, label_rect.y0),
         min(page.rect.width - 5, row_rect.x1 + 15),
         min(page.rect.height, label_rect.y1 + 20),
     )
@@ -543,31 +616,65 @@ def crop_full_row(doc, page_num, label_rect, row_rect, dpi=200):
     return pix
 
 
-def crop_evidence_region(doc, page_num, name_rect, value_rect, same_page=True, dpi=200):
+def crop_evidence_region(doc, page_num, name_rect, value_rect, same_page=True, dpi=200, bureau_hint=None):
     page = doc[page_num]
     highlight = page.add_highlight_annot(value_rect)
     highlight.set_colors(stroke=(1, 0.85, 0))
     highlight.update()
 
+    row_left, _ = _row_extent(page, value_rect.y0)
+
     if same_page:
         # nombre y valor en la misma pagina: recorte normal desde el nombre hasta el valor
-        clip = fitz.Rect(
-            max(0, min(name_rect.x0, value_rect.x0) - 15),
-            max(0, name_rect.y0 - 8),
-            min(page.rect.width, max(name_rect.x1, value_rect.x1) + 260),
-            min(page.rect.height, value_rect.y1 + 20),
-        )
+        left_fixed = min(name_rect.x0, value_rect.x0) - 15
+        right_default = max(name_rect.x1, value_rect.x1) + 260
+        ref_y0 = name_rect.y0
+        # mismo principio que _row_top_boundary en crop_full_row: un margen fijo de -8pt a veces
+        # no alcanza a excluir la fila justo arriba (ej. el encabezado de columna "TransUnion" /
+        # "Experian" impreso arriba del ancla) -- caso real confirmado, cuenta SANTANDER CONSUMER
+        # USA, Ronda 16: ese encabezado quedaba cortado a la mitad en el borde superior del
+        # recorte.
+        top = _row_top_boundary(page, name_rect.y0)
     else:
         # el nombre de la cuenta esta en la pagina anterior (cuenta que cruza el page break) --
         # las coordenadas Y de paginas distintas no son comparables, asi que se recorta desde
         # el inicio de ESTA pagina (donde continua la tabla) hasta el valor, sin usar la
         # posicion vertical del nombre.
-        clip = fitz.Rect(
-            max(0, value_rect.x0 - 200),
-            0,
-            min(page.rect.width, value_rect.x1 + 260),
-            min(page.rect.height, value_rect.y1 + 20),
-        )
+        left_fixed = value_rect.x0 - 200
+        right_default = value_rect.x1 + 260
+        ref_y0 = value_rect.y0
+        top = 0
+
+    # Extiende el borde izquierdo hasta el inicio REAL del texto de esa fila (la etiqueta de la
+    # cuenta, ej. "Tipo de cuenta - Detalle:"), en vez de un margen fijo que a veces no alcanza a
+    # cubrirla -- esto solo puede ampliar el recorte hacia la izquierda, nunca recortarlo mas de
+    # lo que ya estaba (caso real confirmado: columnas Experian/Equifax mas a la derecha que
+    # TransUnion cortaban la etiqueta a la mitad -- "jeta de credito" en vez de "Tarjeta de
+    # credito" -- porque el margen fijo de 200pt no alcanzaba a llegar hasta ahi, Ronda 16).
+    left = min(left_fixed, row_left) if row_left is not None else left_fixed
+
+    # Limite derecho: si se conoce la columna real del buro (bureau_hint), se usa su borde
+    # derecho real (mismo calculo _bureau_x_ranges_near ya usado para desambiguar la busqueda)
+    # en vez de un margen fijo de +260pt -- ese margen fijo puede alcanzar la columna del buro
+    # VECINO cuando las columnas son angostas, mostrando datos de OTRO buro dentro del recorte
+    # de este (caso real confirmado: SANTANDER CONSUMER USA, columnas Experian y Equifax a menos
+    # de 260pt de distancia -- el recorte de "Equifax" terminaba mostrando la misma tabla de
+    # Experian en vez de datos propios, Ronda 16). Solo se usa para ACORTAR el recorte por
+    # defecto, nunca para ampliarlo mas alla de +260pt -- si el calculo de columna no aplica o
+    # no es consistente con el valor real, se mantiene el comportamiento de siempre.
+    right = right_default
+    if bureau_hint:
+        ranges = _bureau_x_ranges_near(page, ref_y0)
+        rng = ranges.get(bureau_hint)
+        if rng is not None and rng[1] >= value_rect.x1:
+            right = min(right_default, rng[1] + 20)
+
+    clip = fitz.Rect(
+        max(0, left),
+        top,
+        min(page.rect.width, right),
+        min(page.rect.height, value_rect.y1 + 20),
+    )
     pix = page.get_pixmap(clip=clip, dpi=dpi)
     return pix
 
@@ -590,17 +697,41 @@ def build_evidence_package(req: BuildPackageRequest):
     item_results: list[ItemResult] = []
     included_count = 0
 
-    cover = output_doc.new_page(width=612, height=792)
-    cover.insert_text((50, 60), "CFPB SUPPORTING EVIDENCE", fontsize=16, fontname="helv")
-    cover.insert_text((50, 90), f"Client: {req.client_name}", fontsize=11, fontname="helv")
-    cover.insert_text((50, 110), f"Report Date: {req.report_date}", fontsize=11, fontname="helv")
-    cover.insert_text((50, 130), f"Evidence Items: {len(req.items)}", fontsize=11, fontname="helv")
-    cover.insert_text((50, 160), "Supporting excerpts from the original credit report.", fontsize=10, fontname="helv")
-    cover.insert_text((50, 175), "Each highlighted value is reproduced exactly as printed in the original document.", fontsize=10, fontname="helv")
+    cover = output_doc.new_page(width=PAGE_W, height=PAGE_H)
+    title = "CFPB SUPPORTING EVIDENCE"
+    cover.insert_text((_centered_x(title, 18, "hebo"), 110), title, fontsize=18, fontname="hebo")
+
+    # Bloque cliente/fecha/total como pares etiqueta-valor alineados en una columna fija de
+    # valores (antes cada linea empezaba en el mismo x=50 sin alinear los VALORES entre si --
+    # ej. "Client:" y "Report Date:" tienen distinto largo, asi que los valores quedaban
+    # escalonados en vez de en una sola columna vertical -- caso reportado por Gabriel, Ronda 17).
+    value_x = MARGIN + 130
+    y = 170
+    for label, value in (
+        ("Client:", req.client_name),
+        ("Report Date:", req.report_date),
+        ("Evidence Items:", str(len(req.items))),
+    ):
+        cover.insert_text((MARGIN, y), label, fontsize=11, fontname="hebo")
+        cover.insert_text((value_x, y), value, fontsize=11, fontname="helv")
+        y += 22
+
+    y += 20
+    cover.insert_text((MARGIN, y), "Supporting excerpts from the original credit report.", fontsize=10, fontname="helv")
+    y += 15
+    cover.insert_text((MARGIN, y), "Each highlighted value is reproduced exactly as printed in the original document.", fontsize=10, fontname="helv")
 
     for item in req.items:
         sub_results = []
         crops = []
+        # Guarda que ubicacion (pagina + posicion) ya se uso como evidencia dentro de ESTE item --
+        # cuando 2 sub_locations de burós distintos resuelven al MISMO texto impreso (caso real
+        # confirmado: Experian y Equifax reportando la misma fecha, sin columna propia de Equifax
+        # en esa tabla -- reporte IdentityIQ de Rangel Peñaranda, Ronda 16), no se presenta la
+        # segunda como una confirmacion HIGH independiente -- seria citar el mismo recorte 2 veces
+        # bajo 2 nombres de buro distintos, exactamente el tipo de sobre-afirmacion que este
+        # proyecto no puede permitirse en un documento legal real.
+        seen_locations = set()
 
         for sub in item.sub_locations:
             if sub.highlight_full_row:
@@ -614,6 +745,14 @@ def build_evidence_package(req: BuildPackageRequest):
                     source_doc, sub.account_name, sub.field_label_text, sub.field_label_candidates, sub.account_name_alternatives
                 )
                 if page_num is not None:
+                    loc_key = (page_num, round(label_rect.x0, 1), round(label_rect.y0, 1))
+                    if loc_key in seen_locations:
+                        sub_results.append(LocatedSubResult(
+                            label=sub.label, located=False, page=page_num + 1, confidence='DUPLICATE',
+                            reason='Esta ubicacion del documento ya fue citada como evidencia de otro buro/etiqueta en este mismo item -- no hay una fila distinta impresa para confirmar esto por separado.'
+                        ))
+                        continue
+                    seen_locations.add(loc_key)
                     pix = crop_full_row(source_doc, page_num, label_rect, row_rect)
                     crops.append((pix, sub, page_num + 1))
                     sub_results.append(LocatedSubResult(
@@ -630,7 +769,15 @@ def build_evidence_package(req: BuildPackageRequest):
                 source_doc, sub.account_name, sub.target_value, sub.bureau_hint, sub.account_number, sub.field_label_text, sub.field_label_candidates, sub.target_value_alternatives, sub.account_name_alternatives
             )
             if page_num is not None and confidence == 'HIGH':
-                pix = crop_evidence_region(source_doc, page_num, name_rect, value_rect, same_page=same_page)
+                loc_key = (page_num, round(value_rect.x0, 1), round(value_rect.y0, 1))
+                if loc_key in seen_locations:
+                    sub_results.append(LocatedSubResult(
+                        label=sub.label, located=False, page=page_num + 1, confidence='DUPLICATE',
+                        reason='Esta ubicacion del documento ya fue citada como evidencia de otro buro en este mismo item (el valor coincide y no hay una columna separada impresa para este buro en este campo) -- no se puede confirmar por separado.'
+                    ))
+                    continue
+                seen_locations.add(loc_key)
+                pix = crop_evidence_region(source_doc, page_num, name_rect, value_rect, same_page=same_page, bureau_hint=sub.bureau_hint)
                 crops.append((pix, sub, page_num + 1))
                 sub_results.append(LocatedSubResult(
                     label=sub.label, located=True, page=page_num + 1, confidence=confidence
@@ -642,7 +789,13 @@ def build_evidence_package(req: BuildPackageRequest):
                     confidence=confidence, reason=reason
                 ))
 
-        all_located = all(sr.located for sr in sub_results) and len(sub_results) > 0
+        # Un sub_location marcado 'DUPLICATE' no es un hueco de evidencia -- es un hecho
+        # estructural del documento (2 burós comparten el mismo dato impreso, sin columna propia
+        # para uno de ellos). No debe bloquear la confirmacion del item completo como si fuera una
+        # busqueda fallida; solo se exige que TODOS los sub_locations que SI representan una
+        # busqueda real (no duplicada) hayan sido encontrados, y que haya al menos 1 confirmado.
+        real_results = [sr for sr in sub_results if sr.confidence != 'DUPLICATE']
+        all_located = len(real_results) > 0 and all(sr.located for sr in real_results)
         overall_confidence = 'HIGH' if all_located else 'LOW'
 
         item_results.append(ItemResult(
@@ -655,26 +808,41 @@ def build_evidence_package(req: BuildPackageRequest):
 
         if all_located:
             included_count += 1
-            evidence_page = output_doc.new_page(width=612, height=792)
-            evidence_page.insert_text((50, 50), f"EVIDENCE {item.discrepancy_id}", fontsize=13, fontname="helv")
-            evidence_page.insert_text((50, 70), item.title, fontsize=11, fontname="helv")
-            evidence_page.insert_text((50, 88), f"Field: {item.field_label}", fontsize=9, fontname="helv")
+            evidence_page = _new_evidence_page(output_doc, req.client_name)
 
-            y_cursor = 110
+            heading = f"EVIDENCE {item.discrepancy_id}"
+            evidence_page.insert_text((_centered_x(heading, 14, "hebo"), 70), heading, fontsize=14, fontname="hebo")
+            evidence_page.insert_text((_centered_x(item.title, 11, "helv"), 88), item.title, fontsize=11, fontname="helv")
+            field_text = f"Field: {item.field_label}"
+            evidence_page.insert_text((_centered_x(field_text, 9, "helv"), 103), field_text, fontsize=9, fontname="helv")
+
+            y_cursor = 128
+            max_img_w = CONTENT_W
+            px_to_pt = 72.0 / 200.0  # los recortes se capturan a 200 DPI (ver crop_evidence_region/crop_full_row)
             for pix, sub, source_page in crops:
-                evidence_page.insert_text((50, y_cursor), f"Source: Original Credit Report - Page {source_page} ({sub.label})", fontsize=8, fontname="helv")
-                y_cursor += 12
-                # Conversion correcta de pixeles a puntos: los recortes se capturan a 200 DPI
-                # (ver dpi=200 en crop_evidence_region/crop_full_row), y 1 punto = 200/72 pixeles
-                # a esa resolucion. Un factor fijo de 0.5 (usado antes) es incorrecto y sobre-
-                # dimensiona la imagen ~40%, arriesgando que se salga de la pagina en recortes
-                # anchos como el modo de fila completa.
-                px_to_pt = 72.0 / 200.0
                 img_w = pix.width * px_to_pt
                 img_h = pix.height * px_to_pt
-                img_rect = fitz.Rect(50, y_cursor, 50 + img_w, y_cursor + img_h)
+                # Nunca dejar que un recorte se salga del margen derecho -- si es mas ancho que el
+                # area util de contenido, se escala hacia abajo manteniendo proporcion (antes se
+                # insertaba a tamano fijo sin limite, dejando un borde derecho inconsistente entre
+                # paginas -- exactamente el "no esta alineado" reportado por Gabriel, Ronda 17).
+                if img_w > max_img_w:
+                    scale = max_img_w / img_w
+                    img_w *= scale
+                    img_h *= scale
+
+                # Si la fuente + imagen no caben en lo que queda de la pagina, se continua en una
+                # pagina nueva en vez de dejar que se corte contra el borde inferior.
+                if y_cursor + 14 + img_h > PAGE_H - MARGIN - FOOTER_SPACE:
+                    evidence_page = _new_evidence_page(output_doc, req.client_name, continuation=True)
+                    y_cursor = 65
+
+                src_text = f"Source: Original Credit Report - Page {source_page} ({sub.label})"
+                evidence_page.insert_text((MARGIN, y_cursor), src_text, fontsize=8, fontname="helv")
+                y_cursor += 14
+                img_rect = fitz.Rect(MARGIN, y_cursor, MARGIN + img_w, y_cursor + img_h)
                 evidence_page.insert_image(img_rect, pixmap=pix)
-                y_cursor = img_rect.y1 + 20
+                y_cursor = img_rect.y1 + 22
 
     source_doc.close()
 
@@ -682,6 +850,12 @@ def build_evidence_package(req: BuildPackageRequest):
 
     output_pdf_base64 = None
     if included_count > 0:
+        # Numeracion de pagina ("Page X of Y") centrada al pie -- solo se puede calcular al final,
+        # una vez que se sabe cuantas paginas tiene el documento completo.
+        total_pages = output_doc.page_count
+        for i, pg in enumerate(output_doc):
+            footer = f"Page {i + 1} of {total_pages}"
+            pg.insert_text((_centered_x(footer, 8, "helv"), PAGE_H - 36), footer, fontsize=8, fontname="helv", color=(0.45, 0.45, 0.45))
         output_bytes = output_doc.tobytes()
         output_pdf_base64 = base64.b64encode(output_bytes).decode("utf-8")
     output_doc.close()
