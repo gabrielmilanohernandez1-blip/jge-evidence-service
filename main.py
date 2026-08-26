@@ -33,6 +33,16 @@ class SubLocation(BaseModel):
     account_number: Optional[str] = None  # ej. "101099****" -- cuando se da, se usa como ancla
     # PRINCIPAL en vez de account_name. Mas confiable que el nombre cuando el nombre es corto
     # (ej. "BCN", "NCB") y aparece muchas veces en tablas de historial de pago de la misma pagina.
+    account_name_alternatives: Optional[list[str]] = None  # variantes cortas/abreviadas de
+    # account_name -- necesario porque el nombre que el analisis de IA usa (normalizado, a veces
+    # el nombre legal completo del acreedor, ej. "NCB MANAGEMENT SERVICES") frecuentemente NO es
+    # el texto literal que aparece impreso como encabezado de la seccion de esa cuenta en el PDF
+    # (caso real confirmado, reporte de Rangel Peñaranda: el encabezado real es solo "NCB", igual
+    # que "SANTANDER" en vez de "SANTANDER CONSUMER USA"). Se prueban TODAS como candidatas de
+    # ancla, igual que target_value_alternatives. Ver tambien _is_reference_mention: el nombre
+    # completo suele SI aparecer en el documento, pero como referencia dentro de OTRA cuenta
+    # (ej. "NCB (Acreedor original: ... SANTANDER CONSUMER USA INC)"), nunca como encabezado
+    # propio -- de ahi que haga falta la forma corta ademas del filtro de mencion-referencial.
     field_label_text: Optional[str] = None  # ej. "Saldo:" -- texto EXACTO de la etiqueta tal como
     # aparece impreso justo antes del valor. Necesario cuando el mismo valor se repite dentro de
     # la MISMA cuenta en varios campos distintos (caso real: Saldo, Credito alto y Vencido pueden
@@ -140,6 +150,39 @@ SAME_PAGE_MAX_VDIST = 300
 PREV_PAGE_MAX_Y = 300
 
 
+# ── Formato del PDF de salida (margenes, tipografia, paginacion) ────────
+# Estandar de documento legal de 1 pulgada de margen en los 4 lados (612x792pt = carta US),
+# titulos centrados en negrita, numeracion de pagina y encabezado repetido en cada pagina de
+# evidencia -- antes todo el texto se insertaba a mano en x=50 fijo (menos de 1 pulgada), sin
+# limite de ancho para las imagenes (podian salirse del margen derecho) y sin numeracion ni
+# encabezado de continuidad -- reportado por Gabriel como "no esta justificado, no esta
+# alineado" (Ronda 17).
+PAGE_W, PAGE_H = 612, 792
+MARGIN = 72  # 1 pulgada
+CONTENT_W = PAGE_W - 2 * MARGIN
+FOOTER_SPACE = 24
+
+
+def _centered_x(text: str, fontsize: float, fontname: str = "helv", page_width: float = PAGE_W) -> float:
+    """x0 para que `text` quede centrado horizontalmente en la pagina."""
+    w = fitz.get_text_length(text, fontname=fontname, fontsize=fontsize)
+    return max(MARGIN, (page_width - w) / 2)
+
+
+def _new_evidence_page(output_doc, client_name: str, continuation: bool = False):
+    """
+    Crea una pagina de evidencia nueva con el encabezado repetido (cliente + nombre del
+    paquete) en la esquina superior -- practica estandar en anexos legales de mas de 1 pagina,
+    para que una pagina no quede huerfana/sin identificar si se separa del resto del paquete al
+    imprimirse o archivarse por separado.
+    """
+    page = output_doc.new_page(width=PAGE_W, height=PAGE_H)
+    suffix = " (cont.)" if continuation else ""
+    header = f"{client_name} — CFPB Supporting Evidence{suffix}"
+    page.insert_text((MARGIN, 40), header, fontsize=8, fontname="helv", color=(0.45, 0.45, 0.45))
+    return page
+
+
 def _is_unique_anchor(doc, anchor_text: str) -> bool:
     """
     True si anchor_text aparece EXACTAMENTE UNA VEZ en TODO el documento. Cuando esto es cierto,
@@ -173,6 +216,56 @@ def _is_unique_anchor(doc, anchor_text: str) -> bool:
         if count > 1:
             return False
     return count == 1
+
+
+# Frases que indican que el nombre encontrado justo despues es una REFERENCIA a otro acreedor
+# (historial de venta/transferencia de deuda), no el encabezado de su propia seccion de cuenta.
+# Caso real confirmado (Rangel Peñaranda, reporte IdentityIQ): "SANTANDER CONSUMER USA" aparece
+# UNA sola vez en todo el documento, dentro del encabezado de la cuenta NCB: "NCB (Acreedor
+# original: 14 SANTANDER CONSUMER USA INC)". Usar esa ocurrencia como ancla de Santander
+# encontraba el Saldo: real de NCB (pagina siguiente) y lo entregaba como evidencia de Santander
+# -- HIGH confidence, pagina y cuenta EQUIVOCADAS. Simetricamente, "NCB" aparece dentro de los
+# comentarios de la propia cuenta Santander ("...Saldo impagado reportado como Vendido a: NCB
+# MANAGEMENT") y por la misma razon podia capturar el Saldo: de OTRA cuenta (STARTAUTOF, que
+# empieza mas abajo en esa misma pagina) etiquetado como si fuera de NCB.
+# NOTA: ya se probo (ver docstring de _is_unique_anchor) un filtro estructural generico basado en
+# "N palabras + dos puntos antes del ancla" y se descarto por rechazar anclas reales igual de
+# seguido (ej. "Cuenta #:"). Esta lista es deliberadamente mas angosta -- frases especificas de
+# venta/transferencia de deuda, no un patron estructural -- para no repetir ese problema.
+REFERENCE_MENTION_MARKERS = [
+    'acreedor original', 'original creditor', 'vendido a', 'sold to',
+    'comprado por', 'purchased by', 'transferido a', 'assigned to',
+]
+
+
+def _is_reference_mention(page, rect) -> bool:
+    """
+    True si el texto inmediatamente antes de `rect` en la misma linea contiene una de las frases
+    de REFERENCE_MENTION_MARKERS -- es decir, el nombre encontrado en `rect` esta siendo
+    mencionado como el acreedor ORIGINAL/ANTERIOR de OTRA cuenta, no como el encabezado de su
+    propia seccion. Se usa para descartar esas ocurrencias como ancla antes de emparejarlas con
+    un valor/etiqueta cercano.
+    """
+    preceding_rect = fitz.Rect(max(0, rect.x0 - 220), rect.y0 - 2, rect.x0, rect.y1 + 2)
+    preceding_text = page.get_textbox(preceding_rect).lower()
+    return any(marker in preceding_text for marker in REFERENCE_MENTION_MARKERS)
+
+
+def _name_candidates(account_name: str, account_name_alternatives: Optional[list] = None) -> list:
+    names = [account_name]
+    if account_name_alternatives:
+        names.extend(n for n in account_name_alternatives if n and n not in names)
+    return names
+
+
+def _search_name_filtered(page, names: list) -> list:
+    """search_for cada candidato de nombre en `page`, descartando menciones referenciales."""
+    matches = []
+    for name in names:
+        for r in page.search_for(name):
+            if not _is_reference_mention(page, r):
+                matches.append(r)
+    return matches
 
 
 def _bureau_x_ranges_near(page, ref_y0: float, max_dist: float = 500):
@@ -259,7 +352,7 @@ def _amount_format_alternatives(value: str) -> list:
     ]
 
 
-def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hint: Optional[str] = None, account_number: Optional[str] = None, field_label_text: Optional[str] = None, field_label_candidates: Optional[list] = None, target_value_alternatives: Optional[list] = None):
+def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hint: Optional[str] = None, account_number: Optional[str] = None, field_label_text: Optional[str] = None, field_label_candidates: Optional[list] = None, target_value_alternatives: Optional[list] = None, account_name_alternatives: Optional[list] = None):
     """
     Busca target_value en cada pagina, y busca el ancla en esa MISMA pagina o en la pagina
     ANTERIOR (las cuentas frecuentemente empiezan con su nombre/numero en una pagina y su tabla
@@ -274,8 +367,21 @@ def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hi
     real confirmado: Saldo, Credito alto y Vencido pueden ser identicos dentro de una sola cuenta)
     y cuando la etiqueta exacta varia segun la plataforma de origen del reporte.
     """
-    anchor_text = account_number if account_number else account_name
-    anchor_is_unique = _is_unique_anchor(doc, anchor_text)
+    using_account_number = bool(account_number)
+    anchor_text = account_number if using_account_number else account_name
+    anchor_names = _name_candidates(account_name, account_name_alternatives)
+    if using_account_number:
+        anchor_is_unique = _is_unique_anchor(doc, anchor_text)
+    else:
+        # Unico si, sumando TODOS los nombres candidatos (account_name + alternativas) y
+        # descartando menciones referenciales (ver _is_reference_mention), aparece una sola vez
+        # en todo el documento.
+        total = 0
+        for pn in range(len(doc)):
+            total += len(_search_name_filtered(doc[pn], anchor_names))
+            if total > 1:
+                break
+        anchor_is_unique = total == 1
     label_variants = []
     if field_label_text:
         label_variants.append(field_label_text)
@@ -316,8 +422,12 @@ def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hi
             if not value_matches:
                 continue
 
-        name_matches_same_page = page.search_for(anchor_text)
-        name_matches_prev_page = doc[page_num - 1].search_for(anchor_text) if page_num > 0 else []
+        if using_account_number:
+            name_matches_same_page = page.search_for(anchor_text)
+            name_matches_prev_page = doc[page_num - 1].search_for(anchor_text) if page_num > 0 else []
+        else:
+            name_matches_same_page = _search_name_filtered(page, anchor_names)
+            name_matches_prev_page = _search_name_filtered(doc[page_num - 1], anchor_names) if page_num > 0 else []
 
         for value_rect in value_matches:
             # Preferencia 1: nombre en la misma pagina, arriba del valor (misma tabla)
@@ -387,7 +497,7 @@ def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hi
     return best_page, best_name_rect, best_value_rect, confidence, reason, (best_source == 'same_page')
 
 
-def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[str] = None, field_label_candidates: Optional[list] = None):
+def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[str] = None, field_label_candidates: Optional[list] = None, account_name_alternatives: Optional[list] = None):
     """
     Modo mas simple y robusto para casos donde no hace falta aislar el valor de UN buro
     especifico (ej. discrepancias sobre identidad de la cuenta, no sobre un dato puntual).
@@ -408,7 +518,13 @@ def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[st
     if not label_variants:
         return None, None, None, None, 'find_full_row_evidence requiere field_label_text o field_label_candidates'
 
-    anchor_is_unique = _is_unique_anchor(doc, account_name)
+    anchor_names = _name_candidates(account_name, account_name_alternatives)
+    total = 0
+    for pn in range(len(doc)):
+        total += len(_search_name_filtered(doc[pn], anchor_names))
+        if total > 1:
+            break
+    anchor_is_unique = total == 1
     page_candidates = []  # una entrada por pagina que tenga al menos un candidato valido
 
     for page_num in range(len(doc)):
@@ -419,8 +535,8 @@ def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[st
         if not label_matches:
             continue
 
-        name_matches_same_page = page.search_for(account_name)
-        name_matches_prev_page = doc[page_num - 1].search_for(account_name) if page_num > 0 else []
+        name_matches_same_page = _search_name_filtered(page, anchor_names)
+        name_matches_prev_page = _search_name_filtered(doc[page_num - 1], anchor_names) if page_num > 0 else []
 
         candidates = []
         for label_rect in label_matches:
@@ -441,11 +557,23 @@ def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[st
     if not page_candidates:
         return None, None, None, None, 'No se encontro el nombre de cuenta y la etiqueta de campo juntos en ninguna pagina'
 
-    if len(page_candidates) > 1:
-        pages_found = [p[0] + 1 for p in page_candidates]
+    # Prioriza same_page sobre prev_page, igual que find_account_value_pair -- una pagina con
+    # ancla Y etiqueta juntas en la MISMA pagina es una senal mucho mas fuerte que una pagina que
+    # solo califico por el fallback de "pagina anterior". Sin esto, un ancla unica en el
+    # documento (ej. "BCN") puede fallar como "ambiguo" solo porque una etiqueta generica como
+    # "Saldo:" tambien aparece cerca del inicio de la pagina SIGUIENTE perteneciendo en realidad
+    # a OTRA cuenta (caso real confirmado: BCN en pagina 5, tabla de JPMCB continua en pagina 6
+    # con su propio "Saldo:" cerca del encabezado) -- eso NO deberia invalidar el match directo y
+    # correcto que ya existe en la misma pagina. Solo se recurre a candidatos prev_page cuando
+    # NINGUNA pagina califico por same_page en todo el documento.
+    same_page_candidates = [p for p in page_candidates if p[2] == 'same_page']
+    effective_candidates = same_page_candidates if same_page_candidates else page_candidates
+
+    if len(effective_candidates) > 1:
+        pages_found = [p[0] + 1 for p in effective_candidates]
         return None, None, None, None, f'La combinacion de nombre de cuenta + etiqueta aparece en mas de una pagina ({pages_found}) -- no se puede confirmar cual es la correcta sin ambiguedad'
 
-    page_num, best_label_rect, source = page_candidates[0]
+    page_num, best_label_rect, source = effective_candidates[0]
     page = doc[page_num]
 
     # Ancho real de la fila: el borde derecho del ultimo texto que comparte la misma linea
@@ -463,6 +591,46 @@ def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[st
     return page_num, best_label_rect, row_rect, (source == 'same_page'), None
 
 
+def _row_extent(page, y0, tolerance=3.0):
+    """
+    Extremos horizontales reales del texto impreso en la fila de y0 (tolerancia en pt),
+    escaneando todas las palabras de la pagina -- mismo principio ya usado para row_right_edge
+    en find_full_row_evidence: nunca usar un margen fijo en puntos para delimitar una fila, no
+    generaliza entre plataformas de origen del reporte ni entre columnas de distinto ancho.
+    """
+    words = page.get_text("words")
+    xs0, xs1 = [], []
+    for w in words:
+        wx0, wy0, wx1, wy1 = w[0], w[1], w[2], w[3]
+        if abs(wy0 - y0) <= tolerance:
+            xs0.append(wx0)
+            xs1.append(wx1)
+    if not xs0:
+        return None, None
+    return min(xs0), max(xs1)
+
+
+def _row_top_boundary(page, y0, lookback=40, margin=6):
+    """
+    Limite superior real para un recorte que empieza en la fila de y0: busca la fila de texto
+    distinta INMEDIATAMENTE ANTERIOR (y1 < y0) dentro de `lookback` puntos hacia arriba y
+    devuelve un punto justo debajo de ella -- evita que el recorte capture la mitad inferior de
+    la fila anterior (caso real confirmado: "Fecha de apertura:" apareciendo cortada a la mitad
+    arriba de "Saldo:" en el modo full-row, Ronda 16). Si no hay fila anterior cercana, usa el
+    margen fijo pequeño de siempre.
+    """
+    words = page.get_text("words")
+    prev_y1 = None
+    for w in words:
+        wy1 = w[3]
+        if wy1 < y0 - 1 and (y0 - wy1) <= lookback:
+            if prev_y1 is None or wy1 > prev_y1:
+                prev_y1 = wy1
+    if prev_y1 is not None:
+        return min(y0, prev_y1 + margin)
+    return max(0, y0 - 8)
+
+
 def crop_full_row(doc, page_num, label_rect, row_rect, dpi=200):
     page = doc[page_num]
     highlight = page.add_highlight_annot(row_rect)
@@ -471,7 +639,7 @@ def crop_full_row(doc, page_num, label_rect, row_rect, dpi=200):
 
     clip = fitz.Rect(
         max(0, label_rect.x0 - 15),
-        max(0, label_rect.y0 - 8),
+        _row_top_boundary(page, label_rect.y0),
         min(page.rect.width - 5, row_rect.x1 + 15),
         min(page.rect.height, label_rect.y1 + 20),
     )
@@ -479,46 +647,141 @@ def crop_full_row(doc, page_num, label_rect, row_rect, dpi=200):
     return pix
 
 
-def crop_evidence_region(doc, page_num, name_rect, value_rect, same_page=True, dpi=200):
+def crop_evidence_region(doc, page_num, name_rect, value_rect, same_page=True, dpi=200, bureau_hint=None):
     page = doc[page_num]
     highlight = page.add_highlight_annot(value_rect)
     highlight.set_colors(stroke=(1, 0.85, 0))
     highlight.update()
 
+    row_left, _ = _row_extent(page, value_rect.y0)
+
     if same_page:
         # nombre y valor en la misma pagina: recorte normal desde el nombre hasta el valor
-        clip = fitz.Rect(
-            max(0, min(name_rect.x0, value_rect.x0) - 15),
-            max(0, name_rect.y0 - 8),
-            min(page.rect.width, max(name_rect.x1, value_rect.x1) + 260),
-            min(page.rect.height, value_rect.y1 + 20),
-        )
+        left_fixed = min(name_rect.x0, value_rect.x0) - 15
+        right_default = max(name_rect.x1, value_rect.x1) + 260
+        ref_y0 = name_rect.y0
+        # mismo principio que _row_top_boundary en crop_full_row: un margen fijo de -8pt a veces
+        # no alcanza a excluir la fila justo arriba (ej. el encabezado de columna "TransUnion" /
+        # "Experian" impreso arriba del ancla) -- caso real confirmado, cuenta SANTANDER CONSUMER
+        # USA, Ronda 16: ese encabezado quedaba cortado a la mitad en el borde superior del
+        # recorte.
+        top = _row_top_boundary(page, name_rect.y0)
     else:
         # el nombre de la cuenta esta en la pagina anterior (cuenta que cruza el page break) --
         # las coordenadas Y de paginas distintas no son comparables, asi que se recorta desde
         # el inicio de ESTA pagina (donde continua la tabla) hasta el valor, sin usar la
         # posicion vertical del nombre.
-        clip = fitz.Rect(
-            max(0, value_rect.x0 - 200),
-            0,
-            min(page.rect.width, value_rect.x1 + 260),
-            min(page.rect.height, value_rect.y1 + 20),
-        )
+        left_fixed = value_rect.x0 - 200
+        right_default = value_rect.x1 + 260
+        ref_y0 = value_rect.y0
+        top = 0
+
+    # Extiende el borde izquierdo hasta el inicio REAL del texto de esa fila (la etiqueta de la
+    # cuenta, ej. "Tipo de cuenta - Detalle:"), en vez de un margen fijo que a veces no alcanza a
+    # cubrirla -- esto solo puede ampliar el recorte hacia la izquierda, nunca recortarlo mas de
+    # lo que ya estaba (caso real confirmado: columnas Experian/Equifax mas a la derecha que
+    # TransUnion cortaban la etiqueta a la mitad -- "jeta de credito" en vez de "Tarjeta de
+    # credito" -- porque el margen fijo de 200pt no alcanzaba a llegar hasta ahi, Ronda 16).
+    left = min(left_fixed, row_left) if row_left is not None else left_fixed
+
+    # Limite derecho: si se conoce la columna real del buro (bureau_hint), se usa su borde
+    # derecho real (mismo calculo _bureau_x_ranges_near ya usado para desambiguar la busqueda)
+    # en vez de un margen fijo de +260pt -- ese margen fijo puede alcanzar la columna del buro
+    # VECINO cuando las columnas son angostas, mostrando datos de OTRO buro dentro del recorte
+    # de este (caso real confirmado: SANTANDER CONSUMER USA, columnas Experian y Equifax a menos
+    # de 260pt de distancia -- el recorte de "Equifax" terminaba mostrando la misma tabla de
+    # Experian en vez de datos propios, Ronda 16). Solo se usa para ACORTAR el recorte por
+    # defecto, nunca para ampliarlo mas alla de +260pt -- si el calculo de columna no aplica o
+    # no es consistente con el valor real, se mantiene el comportamiento de siempre.
+    right = right_default
+    if bureau_hint:
+        ranges = _bureau_x_ranges_near(page, ref_y0)
+        rng = ranges.get(bureau_hint)
+        if rng is not None and rng[1] >= value_rect.x1:
+            right = min(right_default, rng[1] + 20)
+
+    clip = fitz.Rect(
+        max(0, left),
+        top,
+        min(page.rect.width, right),
+        min(page.rect.height, value_rect.y1 + 20),
+    )
     pix = page.get_pixmap(clip=clip, dpi=dpi)
     return pix
 
 
 # ── Endpoint principal: construir el paquete completo ───────────────────
 
-def _make_cover_page(doc, client_name, report_date, total_items):
-    cover = doc.new_page(width=612, height=792)
-    cover.insert_text((50, 60), "CFPB SUPPORTING EVIDENCE", fontsize=16, fontname="helv")
-    cover.insert_text((50, 90), f"Client: {client_name}", fontsize=11, fontname="helv")
-    cover.insert_text((50, 110), f"Report Date: {report_date}", fontsize=11, fontname="helv")
-    cover.insert_text((50, 130), f"Evidence Items: {total_items}", fontsize=11, fontname="helv")
-    cover.insert_text((50, 160), "Supporting excerpts from the original credit report.", fontsize=10, fontname="helv")
-    cover.insert_text((50, 175), "Each highlighted value is reproduced exactly as printed in the original document.", fontsize=10, fontname="helv")
+def _write_cover_page(doc, client_name: str, report_date: str, total_items: int):
+    """
+    Portada con el mismo formato de documento legal (margenes de 1 pulgada, titulo centrado en
+    negrita, bloque cliente/fecha/total alineado en una columna fija de valores -- Ronda 17). Se
+    usa una vez por cada PAQUETE de salida (si el paquete de evidencia se divide en varios
+    archivos por tamano, cada archivo lleva su propia portada identica, para que cada uno sea un
+    documento legal completo y auto-contenido por si solo).
+    """
+    cover = doc.new_page(width=PAGE_W, height=PAGE_H)
+    title = "CFPB SUPPORTING EVIDENCE"
+    cover.insert_text((_centered_x(title, 18, "hebo"), 110), title, fontsize=18, fontname="hebo")
+
+    value_x = MARGIN + 130
+    y = 170
+    for label, value in (
+        ("Client:", client_name),
+        ("Report Date:", report_date),
+        ("Evidence Items:", str(total_items)),
+    ):
+        cover.insert_text((MARGIN, y), label, fontsize=11, fontname="hebo")
+        cover.insert_text((value_x, y), value, fontsize=11, fontname="helv")
+        y += 22
+
+    y += 20
+    cover.insert_text((MARGIN, y), "Supporting excerpts from the original credit report.", fontsize=10, fontname="helv")
+    y += 15
+    cover.insert_text((MARGIN, y), "Each highlighted value is reproduced exactly as printed in the original document.", fontsize=10, fontname="helv")
     return cover
+
+
+def _write_item_pages(doc, client_name: str, item: "EvidenceItem", crops: list):
+    """
+    Escribe la(s) pagina(s) de evidencia de UN item confirmado dentro de `doc` -- encabezado
+    repetido (via _new_evidence_page), titulo/campo centrados, y cada recorte escalado para no
+    salirse del margen (Ronda 17), continuando en una pagina nueva marcada "(cont.)" si las
+    imagenes no caben en lo que queda de la pagina actual. Aislado en su propia funcion para que
+    el empaquetado por tamano (ver build_evidence_package) pueda construir cada item en un
+    documento temporal separado, medir su tamano, y decidir en que paquete cae -- sin duplicar
+    esta logica de layout entre el caso "cabe en el paquete actual" y el caso "no cabe, hay que
+    revertir y abrir un paquete nuevo".
+    """
+    page = _new_evidence_page(doc, client_name)
+
+    heading = f"EVIDENCE {item.discrepancy_id}"
+    page.insert_text((_centered_x(heading, 14, "hebo"), 70), heading, fontsize=14, fontname="hebo")
+    page.insert_text((_centered_x(item.title, 11, "helv"), 88), item.title, fontsize=11, fontname="helv")
+    field_text = f"Field: {item.field_label}"
+    page.insert_text((_centered_x(field_text, 9, "helv"), 103), field_text, fontsize=9, fontname="helv")
+
+    y_cursor = 128
+    max_img_w = CONTENT_W
+    px_to_pt = 72.0 / 200.0  # los recortes se capturan a 200 DPI (ver crop_evidence_region/crop_full_row)
+    for pix, sub, source_page in crops:
+        img_w = pix.width * px_to_pt
+        img_h = pix.height * px_to_pt
+        if img_w > max_img_w:
+            scale = max_img_w / img_w
+            img_w *= scale
+            img_h *= scale
+
+        if y_cursor + 14 + img_h > PAGE_H - MARGIN - FOOTER_SPACE:
+            page = _new_evidence_page(doc, client_name, continuation=True)
+            y_cursor = 65
+
+        src_text = f"Source: Original Credit Report - Page {source_page} ({sub.label})"
+        page.insert_text((MARGIN, y_cursor), src_text, fontsize=8, fontname="helv")
+        y_cursor += 14
+        img_rect = fitz.Rect(MARGIN, y_cursor, MARGIN + img_w, y_cursor + img_h)
+        page.insert_image(img_rect, pixmap=pix)
+        y_cursor = img_rect.y1 + 22
 
 
 @app.post("/build_evidence_package", response_model=BuildPackageResponse)
@@ -539,25 +802,33 @@ def build_evidence_package(req: BuildPackageRequest):
     item_results: list[ItemResult] = []
     included_count = 0
 
-    # ── Empaquetado por tamano ────────────────────────────────────────────
-    # Cada item confirmado (all_located) se arma primero en un documento PDF temporal aparte (1
-    # pagina, con sus recortes de imagen ya insertados) para poder MEDIR su tamano antes de
-    # decidir. Se intenta agregarlo al paquete ("current_doc") que esta en progreso; si al
-    # agregarlo el paquete supera max_bytes Y ya tenia al menos otro item adentro, se revierte
-    # (se saca esa pagina), se cierra el paquete actual tal como estaba ANTES de este item, y se
-    # abre un paquete nuevo que empieza con este item. Un item nunca se descarta por tamano: si un
-    # solo item ya supera max_bytes por si mismo (caso raro), queda como unico ocupante de su
-    # propio paquete aunque ese paquete individual exceda el limite -- partir un item a la mitad
-    # no tiene sentido (es una sola discrepancia, debe llegar completa en un solo archivo) y
-    # perderlo por completo violaria el principio del proyecto de nunca perder evidencia real en
-    # silencio.
+    # ── Empaquetado por tamano (Ronda "paquete < 10MB") ──────────────────────
+    # Cada item confirmado se escribe primero en un documento temporal aparte (con el layout
+    # completo de Ronda 17: encabezado, titulo centrado, recortes escalados, paginas de
+    # continuacion si hace falta) para poder MEDIR su tamano antes de decidir en que paquete cae.
+    # Se intenta agregarlo al paquete que esta en progreso ("current_doc"); si al agregarlo el
+    # paquete supera max_bytes Y ya tenia al menos otro item adentro, se revierte (se sacan las
+    # paginas que se acaban de agregar), se cierra el paquete actual tal como estaba ANTES de
+    # este item (con su propia numeracion de pagina final), y se abre un paquete nuevo -- con su
+    # propia portada -- que empieza con este item. Un item nunca se descarta por tamano: si un
+    # solo item ya supera max_bytes por si mismo, queda como unico ocupante de su propio paquete
+    # aunque ese paquete individual exceda el limite -- partir un item a la mitad no tiene
+    # sentido (es una sola discrepancia, debe llegar completa en un solo archivo) y perderlo por
+    # completo violaria el principio del proyecto de nunca perder evidencia real en silencio.
     finished_packages = []  # list[{"doc_bytes": bytes, "item_ids": list[str]}]
     current_doc = fitz.open()
     current_item_ids: list[str] = []
-    _make_cover_page(current_doc, req.client_name, req.report_date, len(req.items))
+    _write_cover_page(current_doc, req.client_name, req.report_date, len(req.items))
 
     def _finalize_current():
         if current_item_ids:
+            # Numeracion de pagina ("Page X of Y") centrada al pie -- calculada por PAQUETE (no
+            # globalmente), justo antes de cerrarlo, una vez que se sabe cuantas paginas tiene
+            # ESE archivo especifico -- cada paquete es un documento legal completo por si solo.
+            total_pages = current_doc.page_count
+            for i, pg in enumerate(current_doc):
+                footer = f"Page {i + 1} of {total_pages}"
+                pg.insert_text((_centered_x(footer, 8, "helv"), PAGE_H - 36), footer, fontsize=8, fontname="helv", color=(0.45, 0.45, 0.45))
             finished_packages.append({
                 # garbage=4 + deflate=True: sin esto, tobytes() no limpia objetos huerfanos que
                 # queden despues de un delete_page() (ver rollback abajo) -- un item que se
@@ -575,6 +846,14 @@ def build_evidence_package(req: BuildPackageRequest):
     for item in req.items:
         sub_results = []
         crops = []
+        # Guarda que ubicacion (pagina + posicion) ya se uso como evidencia dentro de ESTE item --
+        # cuando 2 sub_locations de burós distintos resuelven al MISMO texto impreso (caso real
+        # confirmado: Experian y Equifax reportando la misma fecha, sin columna propia de Equifax
+        # en esa tabla -- reporte IdentityIQ de Rangel Peñaranda, Ronda 16), no se presenta la
+        # segunda como una confirmacion HIGH independiente -- seria citar el mismo recorte 2 veces
+        # bajo 2 nombres de buro distintos, exactamente el tipo de sobre-afirmacion que este
+        # proyecto no puede permitirse en un documento legal real.
+        seen_locations = set()
 
         for sub in item.sub_locations:
             if sub.highlight_full_row:
@@ -585,9 +864,17 @@ def build_evidence_package(req: BuildPackageRequest):
                     ))
                     continue
                 page_num, label_rect, row_rect, same_page, fail_reason = find_full_row_evidence(
-                    source_doc, sub.account_name, sub.field_label_text, sub.field_label_candidates
+                    source_doc, sub.account_name, sub.field_label_text, sub.field_label_candidates, sub.account_name_alternatives
                 )
                 if page_num is not None:
+                    loc_key = (page_num, round(label_rect.x0, 1), round(label_rect.y0, 1))
+                    if loc_key in seen_locations:
+                        sub_results.append(LocatedSubResult(
+                            label=sub.label, located=False, page=page_num + 1, confidence='DUPLICATE',
+                            reason='Esta ubicacion del documento ya fue citada como evidencia de otro buro/etiqueta en este mismo item -- no hay una fila distinta impresa para confirmar esto por separado.'
+                        ))
+                        continue
+                    seen_locations.add(loc_key)
                     pix = crop_full_row(source_doc, page_num, label_rect, row_rect)
                     crops.append((pix, sub, page_num + 1))
                     sub_results.append(LocatedSubResult(
@@ -601,10 +888,18 @@ def build_evidence_package(req: BuildPackageRequest):
                 continue
 
             page_num, name_rect, value_rect, confidence, reason, same_page = find_account_value_pair(
-                source_doc, sub.account_name, sub.target_value, sub.bureau_hint, sub.account_number, sub.field_label_text, sub.field_label_candidates, sub.target_value_alternatives
+                source_doc, sub.account_name, sub.target_value, sub.bureau_hint, sub.account_number, sub.field_label_text, sub.field_label_candidates, sub.target_value_alternatives, sub.account_name_alternatives
             )
             if page_num is not None and confidence == 'HIGH':
-                pix = crop_evidence_region(source_doc, page_num, name_rect, value_rect, same_page=same_page)
+                loc_key = (page_num, round(value_rect.x0, 1), round(value_rect.y0, 1))
+                if loc_key in seen_locations:
+                    sub_results.append(LocatedSubResult(
+                        label=sub.label, located=False, page=page_num + 1, confidence='DUPLICATE',
+                        reason='Esta ubicacion del documento ya fue citada como evidencia de otro buro en este mismo item (el valor coincide y no hay una columna separada impresa para este buro en este campo) -- no se puede confirmar por separado.'
+                    ))
+                    continue
+                seen_locations.add(loc_key)
+                pix = crop_evidence_region(source_doc, page_num, name_rect, value_rect, same_page=same_page, bureau_hint=sub.bureau_hint)
                 crops.append((pix, sub, page_num + 1))
                 sub_results.append(LocatedSubResult(
                     label=sub.label, located=True, page=page_num + 1, confidence=confidence
@@ -616,7 +911,13 @@ def build_evidence_package(req: BuildPackageRequest):
                     confidence=confidence, reason=reason
                 ))
 
-        all_located = all(sr.located for sr in sub_results) and len(sub_results) > 0
+        # Un sub_location marcado 'DUPLICATE' no es un hueco de evidencia -- es un hecho
+        # estructural del documento (2 burós comparten el mismo dato impreso, sin columna propia
+        # para uno de ellos). No debe bloquear la confirmacion del item completo como si fuera una
+        # busqueda fallida; solo se exige que TODOS los sub_locations que SI representan una
+        # busqueda real (no duplicada) hayan sido encontrados, y que haya al menos 1 confirmado.
+        real_results = [sr for sr in sub_results if sr.confidence != 'DUPLICATE']
+        all_located = len(real_results) > 0 and all(sr.located for sr in real_results)
         overall_confidence = 'HIGH' if all_located else 'LOW'
 
         item_results.append(ItemResult(
@@ -632,34 +933,15 @@ def build_evidence_package(req: BuildPackageRequest):
 
         included_count += 1
 
-        # Armar la pagina de evidencia de este item en un documento temporal aparte -- identico
-        # en contenido a como se armaba antes (misma logica, mismo layout), solo que ahora se
-        # construye por separado para poder medir su tamano antes de decidir en que paquete cae.
+        # Construir la(s) pagina(s) de este item (layout completo de Ronda 17) en un documento
+        # temporal aparte, para poder medir su tamano antes de decidir en que paquete cae.
         temp_doc = fitz.open()
-        temp_page = temp_doc.new_page(width=612, height=792)
-        temp_page.insert_text((50, 50), f"EVIDENCE {item.discrepancy_id}", fontsize=13, fontname="helv")
-        temp_page.insert_text((50, 70), item.title, fontsize=11, fontname="helv")
-        temp_page.insert_text((50, 88), f"Field: {item.field_label}", fontsize=9, fontname="helv")
+        _write_item_pages(temp_doc, req.client_name, item, crops)
 
-        y_cursor = 110
-        for pix, sub, source_page in crops:
-            temp_page.insert_text((50, y_cursor), f"Source: Original Credit Report - Page {source_page} ({sub.label})", fontsize=8, fontname="helv")
-            y_cursor += 12
-            # Conversion correcta de pixeles a puntos: los recortes se capturan a 200 DPI (ver
-            # dpi=200 en crop_evidence_region/crop_full_row), y 1 punto = 200/72 pixeles a esa
-            # resolucion. Un factor fijo de 0.5 (usado antes) es incorrecto y sobre-dimensiona la
-            # imagen ~40%, arriesgando que se salga de la pagina en recortes anchos como el modo
-            # de fila completa.
-            px_to_pt = 72.0 / 200.0
-            img_w = pix.width * px_to_pt
-            img_h = pix.height * px_to_pt
-            img_rect = fitz.Rect(50, y_cursor, 50 + img_w, y_cursor + img_h)
-            temp_page.insert_image(img_rect, pixmap=pix)
-            y_cursor = img_rect.y1 + 20
-
-        # Intentar que quepa en el paquete actual.
+        before_count = current_doc.page_count
         current_doc.insert_pdf(temp_doc)
         current_item_ids.append(item.discrepancy_id)
+        pages_added = current_doc.page_count - before_count
         # Misma razon que en _finalize_current: medir con garbage=4+deflate=True, no con el
         # tamano "crudo" sin comprimir -- si no, la decision de si algo "cabe" se toma contra un
         # numero que no refleja el tamano real del archivo que se va a enviar.
@@ -667,15 +949,18 @@ def build_evidence_package(req: BuildPackageRequest):
         is_only_item_so_far = (len(current_item_ids) == 1)
 
         if not fits and not is_only_item_so_far:
-            # No cabe junto con lo que ya habia en este paquete -- revertir (sacar la pagina que
-            # se acaba de agregar), cerrar el paquete actual tal como estaba antes de este item, y
-            # abrir un paquete nuevo que arranca con este item.
-            current_doc.delete_page(current_doc.page_count - 1)
+            # No cabe junto con lo que ya habia en este paquete -- revertir (sacar TODAS las
+            # paginas que se acaban de agregar para este item -- puede ser mas de 1 si el item
+            # necesito una pagina de continuacion), cerrar el paquete actual tal como estaba
+            # antes de este item, y abrir un paquete nuevo -- con su propia portada -- que
+            # arranca con este item.
+            for _ in range(pages_added):
+                current_doc.delete_page(current_doc.page_count - 1)
             current_item_ids.pop()
             _finalize_current()
             current_doc = fitz.open()
             current_item_ids = []
-            _make_cover_page(current_doc, req.client_name, req.report_date, len(req.items))
+            _write_cover_page(current_doc, req.client_name, req.report_date, len(req.items))
             current_doc.insert_pdf(temp_doc)
             current_item_ids.append(item.discrepancy_id)
 
@@ -704,7 +989,6 @@ def build_evidence_package(req: BuildPackageRequest):
         evidence_items_included=included_count,
         evidence_items_total=len(req.items),
     )
-
 
 class LocateRequest(BaseModel):
     pdf_base64: str
