@@ -497,7 +497,7 @@ def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hi
     return best_page, best_name_rect, best_value_rect, confidence, reason, (best_source == 'same_page')
 
 
-def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[str] = None, field_label_candidates: Optional[list] = None, account_name_alternatives: Optional[list] = None, account_number: Optional[str] = None):
+def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[str] = None, field_label_candidates: Optional[list] = None, account_name_alternatives: Optional[list] = None, account_number: Optional[str] = None, bureau_hint: Optional[str] = None):
     """
     Modo mas simple y robusto para casos donde no hace falta aislar el valor de UN buro
     especifico (ej. discrepancias sobre identidad de la cuenta, no sobre un dato puntual).
@@ -522,6 +522,20 @@ def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[st
     deliberadamente NO envia account_number porque pueden compartir el mismo numero enmascarado
     entre si (ver Construir Evidence Manifest.js) -- ese caso sigue sin account_number y por lo
     tanto sin cambio de comportamiento aqui.
+
+    Fix 31/08/2026 (segunda vuelta): acepta bureau_hint opcional como ULTIMO desempate cuando,
+    incluso usando account_number, quedan 2-3 paginas candidatas empatadas. Caso real confirmado
+    en produccion (ejecucion 484450 del comparador, cliente Jorney Ortega): CAPITAL ONE BANK USA
+    imprime el MISMO numero de cuenta enmascarado ("xxxxxxxx 3242") bajo sus 3 burós -- el numero
+    de cuenta solo no alcanza para saber cual de esas paginas es la de Experian, Equifax o
+    TransUnion. Se prueba si el texto de bureau_hint aparece cerca (mismo umbral vertical que ya
+    se usa para el ancla/etiqueta) de la fila candidata en CADA pagina candidata, y solo se
+    resuelve si aparece cerca en EXACTAMENTE una de ellas -- si aparece en 0 o en mas de 1 (ej.
+    un pie de pagina generico que menciona los 3 burós en todas las paginas), se deja tal cual
+    ambiguo, igual que antes. Nunca convierte un caso ya ambiguo en HIGH por adivinar; solo
+    actua cuando el desempate es literalmente unico, mismo principio que el resto del archivo.
+    NO probado contra un reporte real (no hay uno disponible en este entorno) -- confirmar con
+    una ejecucion real antes de asumir que resuelve el caso de Capital One.
     """
     label_variants = []
     if field_label_text:
@@ -590,6 +604,15 @@ def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[st
     # NINGUNA pagina califico por same_page en todo el documento.
     same_page_candidates = [p for p in page_candidates if p[2] == 'same_page']
     effective_candidates = same_page_candidates if same_page_candidates else page_candidates
+
+    if len(effective_candidates) > 1 and bureau_hint:
+        bureau_matched = []
+        for page_num, label_rect, source in effective_candidates:
+            bureau_rects = doc[page_num].search_for(bureau_hint)
+            if any(abs(br.y0 - label_rect.y0) <= SAME_PAGE_MAX_VDIST for br in bureau_rects):
+                bureau_matched.append((page_num, label_rect, source))
+        if len(bureau_matched) == 1:
+            effective_candidates = bureau_matched
 
     if len(effective_candidates) > 1:
         pages_found = [p[0] + 1 for p in effective_candidates]
@@ -887,7 +910,7 @@ def build_evidence_package(req: BuildPackageRequest):
                     ))
                     continue
                 page_num, label_rect, row_rect, same_page, fail_reason = find_full_row_evidence(
-                    source_doc, sub.account_name, sub.field_label_text, sub.field_label_candidates, sub.account_name_alternatives, sub.account_number
+                    source_doc, sub.account_name, sub.field_label_text, sub.field_label_candidates, sub.account_name_alternatives, sub.account_number, sub.bureau_hint
                 )
                 if page_num is not None:
                     loc_key = (page_num, round(label_rect.x0, 1), round(label_rect.y0, 1))
