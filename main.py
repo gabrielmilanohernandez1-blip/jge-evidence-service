@@ -497,7 +497,7 @@ def find_account_value_pair(doc, account_name: str, target_value: str, bureau_hi
     return best_page, best_name_rect, best_value_rect, confidence, reason, (best_source == 'same_page')
 
 
-def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[str] = None, field_label_candidates: Optional[list] = None, account_name_alternatives: Optional[list] = None):
+def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[str] = None, field_label_candidates: Optional[list] = None, account_name_alternatives: Optional[list] = None, account_number: Optional[str] = None):
     """
     Modo mas simple y robusto para casos donde no hace falta aislar el valor de UN buro
     especifico (ej. discrepancias sobre identidad de la cuenta, no sobre un dato puntual).
@@ -509,6 +509,19 @@ def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[st
     detiene en la primera coincidencia) y solo confirma con HIGH si exactamente una pagina
     califica -- si mas de una pagina tiene una coincidencia valida, es ambiguo y se reporta
     como tal en vez de adivinar cual es la correcta.
+
+    Fix 31/08/2026: acepta account_number opcional y, cuando se da, lo usa como ANCLA PRINCIPAL
+    en vez de account_name -- misma logica ya probada en find_account_value_pair. El modelo
+    SubLocation ya aceptaba este campo y el llamador de n8n ya lo enviaba (Analyzer, casos
+    'tardios'/'tipo_cuenta_inconsistente' desde el 27/08/2026; comparador, Ronda 2 CFPB desde el
+    31/08/2026) pero esta funcion nunca lo recibia en su firma ni el dispatcher se lo pasaba --
+    se ignoraba en silencio. Un nombre de acreedor corto o generico (ej. "JPMCB CARD SERVICES")
+    puede aparecer en muchas paginas del mismo reporte (resumen, detalle por buro, historial de
+    pagos, mencion como acreedor original de otra cuenta), y el numero de cuenta es mucho mas
+    especifico. El caso de identidad ambigua entre 2+ nombres candidatos (ej. BCN/NCB)
+    deliberadamente NO envia account_number porque pueden compartir el mismo numero enmascarado
+    entre si (ver Construir Evidence Manifest.js) -- ese caso sigue sin account_number y por lo
+    tanto sin cambio de comportamiento aqui.
     """
     label_variants = []
     if field_label_text:
@@ -518,13 +531,17 @@ def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[st
     if not label_variants:
         return None, None, None, None, 'find_full_row_evidence requiere field_label_text o field_label_candidates'
 
+    using_account_number = bool(account_number)
     anchor_names = _name_candidates(account_name, account_name_alternatives)
-    total = 0
-    for pn in range(len(doc)):
-        total += len(_search_name_filtered(doc[pn], anchor_names))
-        if total > 1:
-            break
-    anchor_is_unique = total == 1
+    if using_account_number:
+        anchor_is_unique = _is_unique_anchor(doc, account_number)
+    else:
+        total = 0
+        for pn in range(len(doc)):
+            total += len(_search_name_filtered(doc[pn], anchor_names))
+            if total > 1:
+                break
+        anchor_is_unique = total == 1
     page_candidates = []  # una entrada por pagina que tenga al menos un candidato valido
 
     for page_num in range(len(doc)):
@@ -535,8 +552,12 @@ def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[st
         if not label_matches:
             continue
 
-        name_matches_same_page = _search_name_filtered(page, anchor_names)
-        name_matches_prev_page = _search_name_filtered(doc[page_num - 1], anchor_names) if page_num > 0 else []
+        if using_account_number:
+            name_matches_same_page = page.search_for(account_number)
+            name_matches_prev_page = doc[page_num - 1].search_for(account_number) if page_num > 0 else []
+        else:
+            name_matches_same_page = _search_name_filtered(page, anchor_names)
+            name_matches_prev_page = _search_name_filtered(doc[page_num - 1], anchor_names) if page_num > 0 else []
 
         candidates = []
         for label_rect in label_matches:
@@ -555,7 +576,8 @@ def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[st
         page_candidates.append((page_num, best_label_rect, source))
 
     if not page_candidates:
-        return None, None, None, None, 'No se encontro el nombre de cuenta y la etiqueta de campo juntos en ninguna pagina'
+        anchor_desc = 'numero de cuenta' if using_account_number else 'nombre de cuenta'
+        return None, None, None, None, f'No se encontro el {anchor_desc} y la etiqueta de campo juntos en ninguna pagina'
 
     # Prioriza same_page sobre prev_page, igual que find_account_value_pair -- una pagina con
     # ancla Y etiqueta juntas en la MISMA pagina es una senal mucho mas fuerte que una pagina que
@@ -571,7 +593,8 @@ def find_full_row_evidence(doc, account_name: str, field_label_text: Optional[st
 
     if len(effective_candidates) > 1:
         pages_found = [p[0] + 1 for p in effective_candidates]
-        return None, None, None, None, f'La combinacion de nombre de cuenta + etiqueta aparece en mas de una pagina ({pages_found}) -- no se puede confirmar cual es la correcta sin ambiguedad'
+        anchor_desc = 'numero de cuenta' if using_account_number else 'nombre de cuenta'
+        return None, None, None, None, f'La combinacion de {anchor_desc} + etiqueta aparece en mas de una pagina ({pages_found}) -- no se puede confirmar cual es la correcta sin ambiguedad'
 
     page_num, best_label_rect, source = effective_candidates[0]
     page = doc[page_num]
@@ -864,7 +887,7 @@ def build_evidence_package(req: BuildPackageRequest):
                     ))
                     continue
                 page_num, label_rect, row_rect, same_page, fail_reason = find_full_row_evidence(
-                    source_doc, sub.account_name, sub.field_label_text, sub.field_label_candidates, sub.account_name_alternatives
+                    source_doc, sub.account_name, sub.field_label_text, sub.field_label_candidates, sub.account_name_alternatives, sub.account_number
                 )
                 if page_num is not None:
                     loc_key = (page_num, round(label_rect.x0, 1), round(label_rect.y0, 1))
